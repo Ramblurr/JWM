@@ -15,6 +15,7 @@ endif()
 file(GLOB SOURCES_CXX ${CMAKE_CURRENT_LIST_DIR}/../shared/cc/*.cc ${CMAKE_CURRENT_LIST_DIR}/cc/*.cc)
 file(GLOB SOURCES_CXX_IMPL ${CMAKE_CURRENT_LIST_DIR}/../shared/cc/impl/*.cc)
 add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL})
+find_library(WAYLAND_CLIENT_LIB wayland-client HINTS ENV LD_LIBRARY_PATH REQUIRED)
 
 set(JAVA_HOME $ENV{JAVA_HOME})
 if (NOT JAVA_HOME)
@@ -29,3 +30,4 @@ endif()
 
 target_include_directories(jwm PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../shared/cc ${JAVA_HOME}/include ${JAVA_HOME}/include/linux)
 set_target_properties(jwm PROPERTIES OUTPUT_NAME "jwm_wayland_${JWM_ARCH}")
+target_link_libraries(jwm PRIVATE ${WAYLAND_CLIENT_LIB})

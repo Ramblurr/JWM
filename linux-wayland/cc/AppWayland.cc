@@ -1,8 +1,7 @@
 #include <jni.h>
-#include <condition_variable>
-#include <mutex>
-#include <queue>
+#include <vector>
 
+#include "WindowManagerWayland.hh"
 #include "impl/Library.hh"
 
 namespace jwm {
@@ -10,46 +9,40 @@ namespace jwm {
     public:
         void init(JNIEnv* env) {
             _jniEnv = env;
-            _terminateRequested = false;
         }
 
         void start() {
-            std::unique_lock<std::mutex> lock(_mutex);
-            while (!_terminateRequested) {
-                _cv.wait(lock, [this] {
-                    return _terminateRequested || !_callbacks.empty();
-                });
-
-                while (!_callbacks.empty()) {
-                    jobject callbackRef = _callbacks.front();
-                    _callbacks.pop();
-                    lock.unlock();
-                    jwm::classes::Runnable::run(_jniEnv, callbackRef);
-                    _jniEnv->DeleteGlobalRef(callbackRef);
-                    lock.lock();
-                }
+            if (!_windowManager.connect()) {
+                classes::Throwable::throwRuntimeException(_jniEnv, "Failed to initialize Wayland display connection");
+                return;
             }
+            _windowManager.runLoop();
         }
 
         void terminate() {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _terminateRequested = true;
-            _cv.notify_all();
+            _windowManager.terminate();
         }
 
         void enqueueCallback(jobject callbackRef) {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _callbacks.push(callbackRef);
-            _cv.notify_all();
+            _windowManager.enqueueTask([this, callbackRef]() {
+                classes::Runnable::run(_jniEnv, callbackRef);
+                _jniEnv->DeleteGlobalRef(callbackRef);
+            });
+        }
+
+        std::vector<ScreenInfoWayland> getScreens() const {
+            return _windowManager.getScreens();
         }
 
     private:
         JNIEnv* _jniEnv = nullptr;
-        std::mutex _mutex;
-        std::condition_variable _cv;
-        std::queue<jobject> _callbacks;
-        bool _terminateRequested = false;
+        WindowManagerWayland _windowManager;
     } appWayland;
+
+    static jobject makeFallbackScreen(JNIEnv* env) {
+        IRect bounds = IRect::makeXYWH(0, 0, 1920, 1080);
+        return classes::Screen::make(env, 1, true, bounds, bounds, 1.f);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_App__1nStart
@@ -66,11 +59,22 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_App__1nTerminate
 
 extern "C" JNIEXPORT jobjectArray JNICALL Java_io_github_humbleui_jwm_App__1nGetScreens
         (JNIEnv* env, jclass cls) {
-    jobjectArray array = env->NewObjectArray(1, jwm::classes::Screen::kCls, nullptr);
-    jwm::IRect bounds = jwm::IRect::makeXYWH(0, 0, 1920, 1080);
-    jobject screen = jwm::classes::Screen::make(env, 1, true, bounds, bounds, 1.f);
-    env->SetObjectArrayElement(array, 0, screen);
-    env->DeleteLocalRef(screen);
+    auto screens = jwm::appWayland.getScreens();
+    if (screens.empty()) {
+        jobjectArray fallback = env->NewObjectArray(1, jwm::classes::Screen::kCls, nullptr);
+        jobject screen = jwm::makeFallbackScreen(env);
+        env->SetObjectArrayElement(fallback, 0, screen);
+        env->DeleteLocalRef(screen);
+        return fallback;
+    }
+
+    jobjectArray array = env->NewObjectArray(screens.size(), jwm::classes::Screen::kCls, nullptr);
+    size_t idx = 0;
+    for (const auto& screen : screens) {
+        jobject screenObj = screen.asJavaObject(env);
+        env->SetObjectArrayElement(array, idx++, screenObj);
+        env->DeleteLocalRef(screenObj);
+    }
     return array;
 }
 
