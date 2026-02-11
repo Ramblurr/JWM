@@ -22,6 +22,7 @@ def main() -> Tuple[str, str, str]:
   jar = build_utils.jar(f"target/jwm-{common.version}.jar", ("target/classes", "."), ("target/maven", "META-INF"))
 
   build_utils.makedirs("target/src/io/github/humbleui/jwm")
+  shutil.copytree("linux-wayland/java", "target/src/io/github/humbleui/jwm", dirs_exist_ok=True)
   shutil.copytree("linux-x11/java", "target/src/io/github/humbleui/jwm", dirs_exist_ok=True)
   shutil.copytree("macos/java", "target/src/io/github/humbleui/jwm", dirs_exist_ok=True)
   shutil.copytree("shared/java", "target/src/io/github/humbleui/jwm", dirs_exist_ok=True)

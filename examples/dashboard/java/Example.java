@@ -96,6 +96,8 @@ public class Example implements Consumer<Event> {
                     e.printStackTrace();
                 }
             }
+            case WAYLAND -> {
+            }
         }
 
         window.setVisible(true);

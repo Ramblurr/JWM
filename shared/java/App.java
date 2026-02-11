@@ -50,6 +50,8 @@ public class App {
             window = new WindowWin32();
         else if (Platform.CURRENT == Platform.MACOS)
             window = new WindowMac();
+        else if (Platform.CURRENT == Platform.WAYLAND)
+            window = new WindowWayland();
         else if (Platform.CURRENT == Platform.X11)
             window = new WindowX11();
         else

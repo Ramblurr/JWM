@@ -32,7 +32,7 @@ public class PanelRendering extends Panel {
             layers = new String[] { "LayerMetalSkija", "LayerGLSkija" };
         else if (Platform.CURRENT == Platform.WINDOWS)
             layers = new String[] { "LayerD3D12Skija", "LayerGLSkija", "SkijaLayerRaster" };
-        else if (Platform.CURRENT == Platform.X11)
+        else if (Platform.CURRENT == Platform.X11 || Platform.CURRENT == Platform.WAYLAND)
             layers = new String[] { "LayerGLSkija", "LayerRasterSkija" };
 
         for (var layerName: layers)

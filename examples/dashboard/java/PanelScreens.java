@@ -18,7 +18,7 @@ public class PanelScreens extends Panel {
         super(window);
         if (Platform.MACOS == Platform.CURRENT) {
             titleStyles = new Options("Default", "Hidden", "Transparent", "Unified", "Unified Compact", "Unified Transparent", "Unified Compact Transparent");
-        } else if (Platform.X11 == Platform.CURRENT) {
+        } else if (Platform.X11 == Platform.CURRENT || Platform.WAYLAND == Platform.CURRENT) {
             titleStyles = new Options("Default", "Hidden");
         }
     }
@@ -58,13 +58,12 @@ public class PanelScreens extends Panel {
                     w.setFullSizeContentView(true);
                 }
             }
-        } else if (Platform.X11 == Platform.CURRENT) {
-            WindowX11 w = (WindowX11) window;
+        } else if (Platform.X11 == Platform.CURRENT || Platform.WAYLAND == Platform.CURRENT) {
             switch (style) {
             case "Default" ->
-                w.setTitlebarVisible(true);
+                window.setTitlebarVisible(true);
             case "Hidden" ->
-                w.setTitlebarVisible(false);
+                window.setTitlebarVisible(false);
             }
         }
     }
