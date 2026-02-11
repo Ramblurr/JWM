@@ -33,7 +33,7 @@ def main():
   else:
     classpath += [
       'target/classes',
-      build_utils.system + '/build'
+      build_utils.platform_dir + '/build'
     ]
 
   if args.skija_dir:

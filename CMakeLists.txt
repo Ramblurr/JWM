@@ -17,6 +17,6 @@ endif()
 
 
 if (UNIX AND NOT APPLE)
-    add_subdirectory(linux)
-    message(STATUS "Configure linux platform module")
+    add_subdirectory(linux-x11)
+    message(STATUS "Configure linux-x11 platform module")
 endif()

@@ -4,7 +4,7 @@ import build_utils, common, os, sys
 def main():
   os.chdir(common.basedir)
   build_utils.rmdir("target")
-  build_utils.rmdir(build_utils.system + "/build")
+  build_utils.rmdir(build_utils.platform_dir + "/build")
   build_utils.rmdir("examples/dashboard/target")
   return 0
 

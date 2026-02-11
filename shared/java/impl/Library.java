@@ -44,7 +44,7 @@ public class Library {
             File library = _extract("/", "jwm_x64.dll", tempDir);
             System.load(library.getAbsolutePath());
         } else if (Platform.CURRENT == Platform.X11) {
-            File library = _extract("/", "libjwm_x64.so", tempDir);
+            File library = _extract("/", "libjwm_x11_x64.so", tempDir);
             System.load(library.getAbsolutePath());
         }
 

@@ -2,7 +2,7 @@
 import argparse, build_utils, common, glob, os, platform, subprocess, sys
 
 def build_native():
-  os.chdir(common.basedir + "/" + build_utils.system)
+  os.chdir(common.basedir + "/" + build_utils.platform_dir)
   subprocess.check_call(["cmake",
     "-DCMAKE_BUILD_TYPE=Release",
     "-B", "build",
@@ -17,8 +17,8 @@ def build_native():
   if os.path.exists('build/libjwm_arm64.dylib'):
     build_utils.copy_newer('build/libjwm_arm64.dylib', '../target/classes/libjwm_arm64.dylib')
   
-  if os.path.exists('build/libjwm_x64.so'):
-    build_utils.copy_newer('build/libjwm_x64.so', '../target/classes/libjwm_x64.so')
+  if os.path.exists('build/libjwm_x11_x64.so'):
+    build_utils.copy_newer('build/libjwm_x11_x64.so', '../target/classes/libjwm_x11_x64.so')
   
   if os.path.exists('build/jwm_x64.dll'):
     build_utils.copy_newer('build/jwm_x64.dll', '../target/classes/jwm_x64.dll')
@@ -27,7 +27,7 @@ def build_native():
 
 def build_java():
   os.chdir(common.basedir)
-  sources = build_utils.files("linux/java/**/*.java", "macos/java/**/*.java", "shared/java/**/*.java",  "windows/java/**/*.java",)
+  sources = build_utils.files("linux-x11/java/**/*.java", "macos/java/**/*.java", "shared/java/**/*.java",  "windows/java/**/*.java",)
   build_utils.javac(sources, "target/classes", classpath=common.deps_compile())
   return 0
 

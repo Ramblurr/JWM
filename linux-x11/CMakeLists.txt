@@ -34,7 +34,7 @@ if (NOT JAVA_HOME)
 endif()
 
 target_include_directories(jwm PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../shared/cc ${JAVA_HOME}/include ${JAVA_HOME}/include/linux)
-set_target_properties(jwm PROPERTIES OUTPUT_NAME "jwm_${JWM_ARCH}")
+set_target_properties(jwm PROPERTIES OUTPUT_NAME "jwm_x11_${JWM_ARCH}")
 
 
 target_link_libraries(jwm PRIVATE X11::X11 X11::Xrandr X11::Xcursor X11::Xi)

@@ -26,7 +26,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: native-linux
-          path: linux/build/libjwm_x64.so
+          path: linux-x11/build/libjwm_x11_x64.so
 
   build_windows:
     runs-on: windows-latest
