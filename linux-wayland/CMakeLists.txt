@@ -66,9 +66,11 @@ add_custom_target(wayland-protocols-codegen
 add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL} ${GENERATED_XDG_OUTPUT_PROTOCOL} ${GENERATED_XDG_SHELL_PROTOCOL})
 add_dependencies(jwm wayland-protocols-codegen)
 find_library(WAYLAND_CLIENT_LIB wayland-client HINTS ENV LD_LIBRARY_PATH REQUIRED)
+find_library(WAYLAND_CURSOR_LIB wayland-cursor HINTS ENV LD_LIBRARY_PATH REQUIRED)
 find_library(WAYLAND_EGL_LIB wayland-egl HINTS ENV LD_LIBRARY_PATH REQUIRED)
 find_library(EGL_LIB EGL HINTS ENV LD_LIBRARY_PATH REQUIRED)
 find_library(OPENGL_LIB GL HINTS ENV LD_LIBRARY_PATH REQUIRED)
+find_library(XKBCOMMON_LIB xkbcommon HINTS ENV LD_LIBRARY_PATH REQUIRED)
 
 set(JAVA_HOME $ENV{JAVA_HOME})
 if (NOT JAVA_HOME)
@@ -83,4 +85,4 @@ endif()
 
 target_include_directories(jwm PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../shared/cc ${JAVA_HOME}/include ${JAVA_HOME}/include/linux ${GENERATED_DIR})
 set_target_properties(jwm PROPERTIES OUTPUT_NAME "jwm_wayland_${JWM_ARCH}")
-target_link_libraries(jwm PRIVATE ${WAYLAND_CLIENT_LIB} ${WAYLAND_EGL_LIB} ${EGL_LIB} ${OPENGL_LIB})
+target_link_libraries(jwm PRIVATE ${WAYLAND_CLIENT_LIB} ${WAYLAND_CURSOR_LIB} ${WAYLAND_EGL_LIB} ${EGL_LIB} ${OPENGL_LIB} ${XKBCOMMON_LIB})

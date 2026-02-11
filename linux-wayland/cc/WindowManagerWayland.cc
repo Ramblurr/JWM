@@ -3,18 +3,30 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
 #include <string>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
+#include <wayland-cursor.h>
+#include <xkbcommon/xkbcommon.h>
 
+#include "AppWayland.hh"
+#include "KeyModifier.hh"
+#include "KeyWayland.hh"
 #include "Log.hh"
-#include "xdg-shell-client-protocol.hh"
+#include "MouseButtonWayland.hh"
+#include "StringUTF16.hh"
+#include "WindowWayland.hh"
+#include "impl/JNILocal.hh"
+#include "impl/Library.hh"
 #include "xdg-output-unstable-v1-client-protocol.hh"
+#include "xdg-shell-client-protocol.hh"
 
 namespace {
     wl_registry_listener kRegistryListener {
@@ -40,6 +52,53 @@ namespace {
     xdg_wm_base_listener kXdgWmBaseListener {
         &jwm::WindowManagerWayland::onXdgWmBasePing
     };
+
+    wl_seat_listener kSeatListener {
+        &jwm::WindowManagerWayland::onSeatCapabilities,
+        &jwm::WindowManagerWayland::onSeatName
+    };
+
+    wl_pointer_listener kPointerListener {
+        &jwm::WindowManagerWayland::onPointerEnter,
+        &jwm::WindowManagerWayland::onPointerLeave,
+        &jwm::WindowManagerWayland::onPointerMotion,
+        &jwm::WindowManagerWayland::onPointerButton,
+        &jwm::WindowManagerWayland::onPointerAxis,
+        &jwm::WindowManagerWayland::onPointerFrame,
+        &jwm::WindowManagerWayland::onPointerAxisSource,
+        &jwm::WindowManagerWayland::onPointerAxisStop,
+        &jwm::WindowManagerWayland::onPointerAxisDiscrete
+    };
+
+    wl_keyboard_listener kKeyboardListener {
+        &jwm::WindowManagerWayland::onKeyboardKeymap,
+        &jwm::WindowManagerWayland::onKeyboardEnter,
+        &jwm::WindowManagerWayland::onKeyboardLeave,
+        &jwm::WindowManagerWayland::onKeyboardKey,
+        &jwm::WindowManagerWayland::onKeyboardModifiers,
+        &jwm::WindowManagerWayland::onKeyboardRepeatInfo
+    };
+
+    constexpr xkb_keycode_t kXkbKeycodeOffset = 8;
+    constexpr float kPixelsPerScroll = 100.0f;
+
+    std::vector<const char*> cursorNamesForType(jwm::MouseCursor cursorType) {
+        switch (cursorType) {
+            case jwm::MouseCursor::ARROW: return {"default", "left_ptr"};
+            case jwm::MouseCursor::CROSSHAIR: return {"crosshair"};
+            case jwm::MouseCursor::HELP: return {"help", "question_arrow"};
+            case jwm::MouseCursor::POINTING_HAND: return {"pointer", "hand2"};
+            case jwm::MouseCursor::IBEAM: return {"text", "xterm"};
+            case jwm::MouseCursor::NOT_ALLOWED: return {"not-allowed", "crossed_circle"};
+            case jwm::MouseCursor::WAIT: return {"wait", "watch"};
+            case jwm::MouseCursor::WIN_UPARROW: return {"up_arrow"};
+            case jwm::MouseCursor::RESIZE_NS: return {"ns-resize", "v_double_arrow"};
+            case jwm::MouseCursor::RESIZE_WE: return {"ew-resize", "h_double_arrow"};
+            case jwm::MouseCursor::RESIZE_NESW: return {"nesw-resize", "size_bdiag"};
+            case jwm::MouseCursor::RESIZE_NWSE: return {"nwse-resize", "size_fdiag"};
+            default: return {"default", "left_ptr"};
+        }
+    }
 }
 
 struct jwm::WaylandOutputState {
@@ -102,6 +161,11 @@ bool jwm::WindowManagerWayland::connect() {
         return false;
     }
 
+    _xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (_xkbContext == nullptr) {
+        JWM_LOG("Wayland: xkb_context_new failed");
+    }
+
     _registry = wl_display_get_registry(_display);
     if (_registry == nullptr) {
         JWM_LOG("Wayland: wl_display_get_registry failed");
@@ -121,7 +185,6 @@ bool jwm::WindowManagerWayland::connect() {
         return false;
     }
 
-    // A second roundtrip lets wl_output listeners deliver geometry/mode/scale updates.
     if (wl_display_roundtrip(_display) < 0) {
         JWM_LOG("Wayland: initial output roundtrip failed");
         _cleanup();
@@ -137,8 +200,87 @@ bool jwm::WindowManagerWayland::connect() {
     return true;
 }
 
+void jwm::WindowManagerWayland::_resetPointer() {
+    _pointerFocusWindow = nullptr;
+    _pointerEnterSerial = 0;
+    _pointerContentX = 0;
+    _pointerContentY = 0;
+    _pointerButtonMask = 0;
+    _pointerAxisPending = false;
+    _pointerAxisDiscretePending = false;
+    _pointerAxisX = 0.0;
+    _pointerAxisY = 0.0;
+    _pointerAxisDiscreteX = 0.0;
+    _pointerAxisDiscreteY = 0.0;
+    _pointerButtonMask = 0;
+
+    if (_cursorSurface != nullptr) {
+        wl_surface_attach(_cursorSurface, nullptr, 0, 0);
+        wl_surface_commit(_cursorSurface);
+    }
+
+    if (_pointer != nullptr) {
+        uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(_pointer));
+        if (version >= WL_POINTER_RELEASE_SINCE_VERSION) {
+            wl_pointer_release(_pointer);
+        } else {
+            wl_pointer_destroy(_pointer);
+        }
+        _pointer = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_resetKeyboard() {
+    _handleKeyboardFocusLeave(false);
+    _keyboardModifiers = 0;
+
+    if (_xkbState != nullptr) {
+        xkb_state_unref(_xkbState);
+        _xkbState = nullptr;
+    }
+    if (_xkbKeymap != nullptr) {
+        xkb_keymap_unref(_xkbKeymap);
+        _xkbKeymap = nullptr;
+    }
+
+    _xkbShiftMod = XKB_MOD_INVALID;
+    _xkbControlMod = XKB_MOD_INVALID;
+    _xkbAltMod = XKB_MOD_INVALID;
+    _xkbLogoMod = XKB_MOD_INVALID;
+    _xkbCapsMod = XKB_MOD_INVALID;
+
+    if (_keyboard != nullptr) {
+        uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(_keyboard));
+        if (version >= WL_KEYBOARD_RELEASE_SINCE_VERSION) {
+            wl_keyboard_release(_keyboard);
+        } else {
+            wl_keyboard_destroy(_keyboard);
+        }
+        _keyboard = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_resetSeat() {
+    _resetPointer();
+    _resetKeyboard();
+
+    if (_seat != nullptr) {
+        if (_seatVersion >= WL_SEAT_RELEASE_SINCE_VERSION) {
+            wl_seat_release(_seat);
+        } else {
+            wl_seat_destroy(_seat);
+        }
+        _seat = nullptr;
+    }
+    _seatName = std::numeric_limits<uint32_t>::max();
+    _seatVersion = 0;
+}
+
 void jwm::WindowManagerWayland::_cleanup() {
     _runLoop = false;
+
+    _resetSeat();
+    _destroyCursorResources();
 
     _clearXdgOutputBindings();
 
@@ -148,6 +290,7 @@ void jwm::WindowManagerWayland::_cleanup() {
         }
     }
     _outputByName.clear();
+    _surfaceToWindow.clear();
 
     if (_xdgOutputManager != nullptr) {
         zxdg_output_manager_v1_destroy(_xdgOutputManager);
@@ -183,6 +326,13 @@ void jwm::WindowManagerWayland::_cleanup() {
         wl_display_disconnect(_display);
         _display = nullptr;
     }
+
+    if (_xkbContext != nullptr) {
+        xkb_context_unref(_xkbContext);
+        _xkbContext = nullptr;
+    }
+
+    _pendingCursorWindow = nullptr;
 
     if (_notifyReadFd >= 0) {
         close(_notifyReadFd);
@@ -354,6 +504,27 @@ bool jwm::WindowManagerWayland::_bindXdgWmBase(wl_registry* registry, uint32_t n
     return true;
 }
 
+bool jwm::WindowManagerWayland::_bindSeat(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_seat != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 7u);
+    _seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, bindVersion));
+    if (_seat == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wl_seat) failed");
+        return false;
+    }
+    _seatName = name;
+    _seatVersion = bindVersion;
+    if (wl_seat_add_listener(_seat, &kSeatListener, this) != 0) {
+        JWM_LOG("Wayland: wl_seat_add_listener failed");
+        _resetSeat();
+        return false;
+    }
+    return true;
+}
+
 wl_display* jwm::WindowManagerWayland::getDisplay() const {
     return _display;
 }
@@ -381,6 +552,166 @@ bool jwm::WindowManagerWayland::isReadyForWindows() const {
 std::vector<jwm::ScreenInfoWayland> jwm::WindowManagerWayland::getScreens() const {
     std::lock_guard<std::mutex> lock(_screensLock);
     return _screens;
+}
+
+void jwm::WindowManagerWayland::registerWindowSurface(wl_surface* surface, WindowWayland* window) {
+    if (surface == nullptr || window == nullptr) {
+        return;
+    }
+    _surfaceToWindow[surface] = window;
+}
+
+void jwm::WindowManagerWayland::unregisterWindowSurface(wl_surface* surface) {
+    if (surface == nullptr) {
+        return;
+    }
+    auto it = _surfaceToWindow.find(surface);
+    if (it == _surfaceToWindow.end()) {
+        return;
+    }
+
+    WindowWayland* window = it->second;
+    _surfaceToWindow.erase(it);
+
+    if (_pointerFocusWindow == window) {
+        _pointerFocusWindow = nullptr;
+        _pointerEnterSerial = 0;
+        _pointerButtonMask = 0;
+        _pointerAxisPending = false;
+        _pointerAxisDiscretePending = false;
+        _pointerAxisX = 0.0;
+        _pointerAxisY = 0.0;
+        _pointerAxisDiscreteX = 0.0;
+        _pointerAxisDiscreteY = 0.0;
+    }
+    if (_keyboardFocusWindow == window && !_isHandlingKeyboardFocusLeave) {
+        _handleKeyboardFocusLeave(false);
+    }
+    if (_pendingCursorWindow == window) {
+        _pendingCursorWindow = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::requestCursorUpdate(WindowWayland* window) {
+    _pendingCursorWindow = window;
+    _applyCursorForFocus();
+}
+
+jwm::WindowWayland* jwm::WindowManagerWayland::_windowBySurface(wl_surface* surface) const {
+    auto it = _surfaceToWindow.find(surface);
+    if (it == _surfaceToWindow.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+bool jwm::WindowManagerWayland::_ensureCursorResources() {
+    if (_cursorTheme != nullptr && _cursorSurface != nullptr) {
+        return true;
+    }
+    if (_shm == nullptr || _compositor == nullptr) {
+        return false;
+    }
+
+    if (_cursorTheme == nullptr) {
+        int themeSize = _cursorThemeSize;
+        const char* envSize = std::getenv("XCURSOR_SIZE");
+        if (envSize != nullptr) {
+            int parsed = std::atoi(envSize);
+            if (parsed > 0) {
+                themeSize = parsed;
+            }
+        }
+        _cursorTheme = wl_cursor_theme_load(nullptr, themeSize, _shm);
+        if (_cursorTheme == nullptr) {
+            JWM_LOG("Wayland: wl_cursor_theme_load failed");
+            return false;
+        }
+        _cursorThemeSize = themeSize;
+    }
+
+    if (_cursorSurface == nullptr) {
+        _cursorSurface = wl_compositor_create_surface(_compositor);
+        if (_cursorSurface == nullptr) {
+            JWM_LOG("Wayland: failed to create cursor surface");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+wl_cursor* jwm::WindowManagerWayland::_cursorForType(MouseCursor cursorType) {
+    auto cached = _cursorByType.find(cursorType);
+    if (cached != _cursorByType.end()) {
+        return cached->second;
+    }
+
+    wl_cursor* cursor = nullptr;
+    auto candidates = cursorNamesForType(cursorType);
+    for (const char* name : candidates) {
+        cursor = wl_cursor_theme_get_cursor(_cursorTheme, name);
+        if (cursor != nullptr) {
+            break;
+        }
+    }
+
+    if (cursor == nullptr) {
+        cursor = wl_cursor_theme_get_cursor(_cursorTheme, "default");
+    }
+
+    _cursorByType[cursorType] = cursor;
+    return cursor;
+}
+
+void jwm::WindowManagerWayland::_destroyCursorResources() {
+    _cursorByType.clear();
+
+    if (_cursorSurface != nullptr) {
+        wl_surface_destroy(_cursorSurface);
+        _cursorSurface = nullptr;
+    }
+    if (_cursorTheme != nullptr) {
+        wl_cursor_theme_destroy(_cursorTheme);
+        _cursorTheme = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_applyCursorForFocus() {
+    if (_pointer == nullptr || _pointerFocusWindow == nullptr || _pointerEnterSerial == 0) {
+        return;
+    }
+
+    if (!_ensureCursorResources()) {
+        return;
+    }
+
+    wl_cursor* cursor = _cursorForType(_pointerFocusWindow->_mouseCursor);
+    if (cursor == nullptr || cursor->image_count == 0 || cursor->images == nullptr || cursor->images[0] == nullptr) {
+        wl_pointer_set_cursor(_pointer, _pointerEnterSerial, nullptr, 0, 0);
+        _pendingCursorWindow = nullptr;
+        return;
+    }
+
+    wl_cursor_image* image = cursor->images[0];
+    wl_buffer* buffer = wl_cursor_image_get_buffer(image);
+    if (buffer == nullptr) {
+        wl_pointer_set_cursor(_pointer, _pointerEnterSerial, nullptr, 0, 0);
+        _pendingCursorWindow = nullptr;
+        return;
+    }
+
+    wl_pointer_set_cursor(
+        _pointer,
+        _pointerEnterSerial,
+        _cursorSurface,
+        static_cast<int32_t>(image->hotspot_x),
+        static_cast<int32_t>(image->hotspot_y)
+    );
+    wl_surface_attach(_cursorSurface, buffer, 0, 0);
+    wl_surface_damage(_cursorSurface, 0, 0, static_cast<int32_t>(image->width), static_cast<int32_t>(image->height));
+    wl_surface_commit(_cursorSurface);
+    _pendingCursorWindow = nullptr;
 }
 
 void jwm::WindowManagerWayland::_notifyLoop() {
@@ -427,6 +758,52 @@ void jwm::WindowManagerWayland::_processTasks() {
     }
 }
 
+int jwm::WindowManagerWayland::_getPollTimeoutMillis() const {
+    if (!_repeat.isActive) {
+        return -1;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (_repeat.nextAt <= now) {
+        return 0;
+    }
+
+    auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(_repeat.nextAt - now).count();
+    if (timeout > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(timeout);
+}
+
+void jwm::WindowManagerWayland::_dispatchRepeatIfNeeded() {
+    if (!_repeat.isActive || _keyboardFocusWindow == nullptr) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (_repeat.nextAt > now) {
+        return;
+    }
+
+    _dispatchKey(
+        _keyboardFocusWindow,
+        _repeat.keycode,
+        true,
+        _repeat.key,
+        _repeat.location,
+        _repeat.extraModifiers,
+        true
+    );
+
+    if (_repeatRate <= 0) {
+        _repeat.isActive = false;
+        return;
+    }
+
+    int intervalMs = std::max(1, 1000 / _repeatRate);
+    _repeat.nextAt = now + std::chrono::milliseconds(intervalMs);
+}
+
 void jwm::WindowManagerWayland::runLoop() {
     if (_display == nullptr) {
         return;
@@ -442,6 +819,7 @@ void jwm::WindowManagerWayland::runLoop() {
     _runLoop = true;
     while (_runLoop) {
         _processTasks();
+        _dispatchRepeatIfNeeded();
 
         while (wl_display_prepare_read(_display) != 0) {
             if (wl_display_dispatch_pending(_display) < 0) {
@@ -449,6 +827,7 @@ void jwm::WindowManagerWayland::runLoop() {
                 break;
             }
             _processTasks();
+            _dispatchRepeatIfNeeded();
         }
         if (!_runLoop) {
             break;
@@ -468,7 +847,7 @@ void jwm::WindowManagerWayland::runLoop() {
         events[1].events = POLLIN;
         events[1].revents = 0;
 
-        int pollStatus = poll(events, 2, -1);
+        int pollStatus = poll(events, 2, _getPollTimeoutMillis());
         if (pollStatus < 0) {
             if (errno == EINTR) {
                 wl_display_cancel_read(_display);
@@ -509,6 +888,299 @@ void jwm::WindowManagerWayland::terminate() {
     _notifyLoop();
 }
 
+void jwm::WindowManagerWayland::_refreshKeyboardModifiers() {
+    int modifiers = KeyWayland::getModifiers();
+
+    if (_xkbState != nullptr) {
+        auto isActive = [this](uint32_t modIdx) {
+            if (modIdx == XKB_MOD_INVALID) {
+                return false;
+            }
+            return xkb_state_mod_index_is_active(_xkbState, modIdx, XKB_STATE_MODS_EFFECTIVE) > 0;
+        };
+
+        if (isActive(_xkbShiftMod)) modifiers |= (int) KeyModifier::SHIFT;
+        if (isActive(_xkbControlMod)) modifiers |= (int) KeyModifier::CONTROL;
+        if (isActive(_xkbAltMod)) modifiers |= (int) KeyModifier::ALT;
+        if (isActive(_xkbLogoMod)) modifiers |= (int) KeyModifier::LINUX_SUPER;
+        if (isActive(_xkbCapsMod)) modifiers |= (int) KeyModifier::CAPS_LOCK;
+    }
+
+    _keyboardModifiers = modifiers;
+}
+
+bool jwm::WindowManagerWayland::_translateKeycode(uint32_t keycode, Key& key, KeyLocation& location, int& extraModifiers) const {
+    key = Key::UNDEFINED;
+    location = KeyLocation::DEFAULT;
+    extraModifiers = 0;
+
+    if (_xkbState == nullptr) {
+        return false;
+    }
+
+    xkb_keycode_t xkbCode = static_cast<xkb_keycode_t>(keycode + kXkbKeycodeOffset);
+    xkb_keysym_t keysym = xkb_state_key_get_one_sym(_xkbState, xkbCode);
+    key = KeyWayland::fromKeysym(keysym, location, extraModifiers);
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_shouldRepeatKey(uint32_t keycode) const {
+    if (_xkbKeymap == nullptr || _repeatRate <= 0) {
+        return false;
+    }
+    xkb_keycode_t xkbCode = static_cast<xkb_keycode_t>(keycode + kXkbKeycodeOffset);
+    return xkb_keymap_key_repeats(_xkbKeymap, xkbCode) > 0;
+}
+
+void jwm::WindowManagerWayland::_scheduleRepeat(uint32_t keycode, Key key, KeyLocation location, int extraModifiers) {
+    if (_repeatRate <= 0 || _repeatDelay < 0) {
+        return;
+    }
+
+    _repeat.isActive = true;
+    _repeat.keycode = keycode;
+    _repeat.key = key;
+    _repeat.location = location;
+    _repeat.extraModifiers = extraModifiers;
+    _repeat.nextAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(_repeatDelay);
+}
+
+void jwm::WindowManagerWayland::_cancelRepeat(uint32_t keycode) {
+    if (!_repeat.isActive) {
+        return;
+    }
+    if (keycode != std::numeric_limits<uint32_t>::max() && keycode != _repeat.keycode) {
+        return;
+    }
+    _repeat.isActive = false;
+}
+
+void jwm::WindowManagerWayland::_dispatchTextInput(WindowWayland* window, uint32_t keycode) {
+    if (window == nullptr || _xkbState == nullptr) {
+        return;
+    }
+
+    xkb_keycode_t xkbCode = static_cast<xkb_keycode_t>(keycode + kXkbKeycodeOffset);
+    char utf8[128];
+    int count = xkb_state_key_get_utf8(_xkbState, xkbCode, utf8, sizeof(utf8));
+    if (count <= 0) {
+        return;
+    }
+
+    if (count >= static_cast<int>(sizeof(utf8))) {
+        count = static_cast<int>(sizeof(utf8)) - 1;
+    }
+    utf8[count] = 0;
+
+    unsigned char first = static_cast<unsigned char>(utf8[0]);
+    if (first == 127 || first <= 0x1f) {
+        return;
+    }
+
+    JNIEnv* env = getWaylandJniEnv();
+    if (env == nullptr) {
+        return;
+    }
+
+    StringUTF16 text = utf8;
+    JNILocal<jstring> jText = text.toJString(env);
+    JNILocal<jobject> eventText(env, classes::EventTextInput::make(env, jText.get()));
+    window->dispatch(eventText.get());
+}
+
+void jwm::WindowManagerWayland::_dispatchKey(WindowWayland* window, uint32_t keycode, bool isPressed, Key key, KeyLocation location, int extraModifiers, bool emitTextInput) {
+    if (window == nullptr) {
+        return;
+    }
+
+    if (key != Key::UNDEFINED) {
+        KeyWayland::setKeyState(key, isPressed);
+    }
+
+    _refreshKeyboardModifiers();
+
+    JNIEnv* env = getWaylandJniEnv();
+    if (env == nullptr) {
+        return;
+    }
+
+    int modifiers = _keyboardModifiers | extraModifiers;
+    JNILocal<jobject> eventKey(env, classes::EventKey::make(env, key, static_cast<jboolean>(isPressed), modifiers, location));
+    window->dispatch(eventKey.get());
+
+    if (emitTextInput && isPressed) {
+        _dispatchTextInput(window, keycode);
+    }
+}
+
+void jwm::WindowManagerWayland::_handleKeyboardFocusEnter(WindowWayland* window, wl_array* keys) {
+    bool focusChanged = window != _keyboardFocusWindow;
+    if (_keyboardFocusWindow != nullptr && _keyboardFocusWindow != window) {
+        _handleKeyboardFocusLeave(true);
+    }
+
+    _keyboardFocusWindow = window;
+    _pressedKeys.clear();
+    KeyWayland::clearKeyStates();
+
+    if (window != nullptr && keys != nullptr && _xkbState != nullptr) {
+        uint32_t* pressed = static_cast<uint32_t*>(keys->data);
+        size_t count = keys->size / sizeof(uint32_t);
+        for (size_t i = 0; i < count; ++i) {
+            Key key;
+            KeyLocation location;
+            int extraModifiers;
+            if (!_translateKeycode(pressed[i], key, location, extraModifiers) || key == Key::UNDEFINED) {
+                continue;
+            }
+
+            KeyWayland::setKeyState(key, true);
+            _pressedKeys[pressed[i]] = PressedKeyState {
+                key,
+                location,
+                extraModifiers,
+                _shouldRepeatKey(pressed[i])
+            };
+        }
+    }
+
+    _refreshKeyboardModifiers();
+
+    if (focusChanged && window != nullptr) {
+        window->dispatch(classes::EventWindowFocusIn::kInstance);
+    }
+}
+
+void jwm::WindowManagerWayland::_handleKeyboardFocusLeave(bool dispatchFocusOut) {
+    if (_isHandlingKeyboardFocusLeave) {
+        return;
+    }
+    _isHandlingKeyboardFocusLeave = true;
+
+    WindowWayland* focusedWindow = _keyboardFocusWindow;
+    std::vector<std::pair<uint32_t, PressedKeyState>> pressedKeysSnapshot;
+    pressedKeysSnapshot.reserve(_pressedKeys.size());
+    for (const auto& entry : _pressedKeys) {
+        pressedKeysSnapshot.push_back(entry);
+    }
+
+    // Clear manager focus/key state first so user callbacks cannot re-enter
+    // and reprocess the same key set while we dispatch synthetic releases.
+    _keyboardFocusWindow = nullptr;
+    _pressedKeys.clear();
+    _cancelRepeat(std::numeric_limits<uint32_t>::max());
+
+    for (const auto& entry : pressedKeysSnapshot) {
+        const PressedKeyState& state = entry.second;
+        _dispatchKey(focusedWindow, entry.first, false, state.key, state.location, state.extraModifiers, false);
+    }
+
+    KeyWayland::clearKeyStates();
+    _refreshKeyboardModifiers();
+
+    if (dispatchFocusOut && focusedWindow != nullptr) {
+        focusedWindow->dispatch(classes::EventWindowFocusOut::kInstance);
+    }
+    _isHandlingKeyboardFocusLeave = false;
+}
+
+void jwm::WindowManagerWayland::_dispatchMouseMove(WindowWayland* window, int movementX, int movementY) {
+    if (window == nullptr) {
+        return;
+    }
+
+    JNIEnv* env = getWaylandJniEnv();
+    if (env == nullptr) {
+        return;
+    }
+
+    JNILocal<jobject> eventMove(env, classes::EventMouseMove::make(
+        env,
+        _pointerContentX,
+        _pointerContentY,
+        movementX,
+        movementY,
+        _pointerButtonMask,
+        _keyboardModifiers
+    ));
+    window->dispatch(eventMove.get());
+}
+
+void jwm::WindowManagerWayland::_dispatchMouseButton(WindowWayland* window, MouseButton button, bool isPressed) {
+    if (window == nullptr) {
+        return;
+    }
+
+    JNIEnv* env = getWaylandJniEnv();
+    if (env == nullptr) {
+        return;
+    }
+
+    JNILocal<jobject> eventButton(env, classes::EventMouseButton::make(
+        env,
+        button,
+        static_cast<jboolean>(isPressed),
+        _pointerContentX,
+        _pointerContentY,
+        _keyboardModifiers
+    ));
+    window->dispatch(eventButton.get());
+}
+
+void jwm::WindowManagerWayland::_dispatchMouseScroll(WindowWayland* window, float deltaX, float deltaY, float deltaChars, float deltaLines) {
+    if (window == nullptr) {
+        return;
+    }
+
+    JNIEnv* env = getWaylandJniEnv();
+    if (env == nullptr) {
+        return;
+    }
+
+    JNILocal<jobject> eventScroll(env, classes::EventMouseScroll::make(
+        env,
+        deltaX,
+        deltaY,
+        deltaChars,
+        deltaLines,
+        0.0f,
+        _pointerContentX,
+        _pointerContentY,
+        _keyboardModifiers
+    ));
+    window->dispatch(eventScroll.get());
+}
+
+void jwm::WindowManagerWayland::_flushPointerAxis() {
+    if (!_pointerAxisPending && !_pointerAxisDiscretePending) {
+        return;
+    }
+
+    WindowWayland* window = _pointerFocusWindow;
+    if (window != nullptr) {
+        float deltaX = static_cast<float>(-_pointerAxisX * kPixelsPerScroll);
+        float deltaY = static_cast<float>(-_pointerAxisY * kPixelsPerScroll);
+        float deltaChars = static_cast<float>(-_pointerAxisDiscreteX);
+        float deltaLines = static_cast<float>(-_pointerAxisDiscreteY);
+
+        if (deltaX == 0.0f && deltaChars != 0.0f) {
+            deltaX = deltaChars * kPixelsPerScroll;
+        }
+        if (deltaY == 0.0f && deltaLines != 0.0f) {
+            deltaY = deltaLines * kPixelsPerScroll;
+        }
+
+        _dispatchMouseScroll(window, deltaX, deltaY, deltaChars, deltaLines);
+    }
+
+    _pointerAxisPending = false;
+    _pointerAxisDiscretePending = false;
+    _pointerAxisX = 0.0;
+    _pointerAxisY = 0.0;
+    _pointerAxisDiscreteX = 0.0;
+    _pointerAxisDiscreteY = 0.0;
+}
+
 void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
@@ -525,6 +1197,10 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
     }
     if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
         manager->_bindXdgOutputManager(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, wl_seat_interface.name) == 0) {
+        manager->_bindSeat(registry, name, version);
         return;
     }
     if (strcmp(interface, wl_output_interface.name) != 0) {
@@ -556,6 +1232,7 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
 void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* registry, uint32_t name) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
     if (name == manager->_compositorName) {
+        manager->_destroyCursorResources();
         if (manager->_compositor != nullptr) {
             wl_compositor_destroy(manager->_compositor);
             manager->_compositor = nullptr;
@@ -572,11 +1249,16 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         return;
     }
     if (name == manager->_shmName) {
+        manager->_destroyCursorResources();
         if (manager->_shm != nullptr) {
             wl_shm_destroy(manager->_shm);
             manager->_shm = nullptr;
         }
         manager->_shmName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
+    if (name == manager->_seatName) {
+        manager->_resetSeat();
         return;
     }
     if (name == manager->_xdgOutputManagerName) {
@@ -666,4 +1348,292 @@ void jwm::WindowManagerWayland::onXdgOutputDescription(void* data, zxdg_output_v
 void jwm::WindowManagerWayland::onXdgWmBasePing(void* data, xdg_wm_base* xdgWmBase, uint32_t serial) {
     (void) data;
     xdg_wm_base_pong(xdgWmBase, serial);
+}
+
+void jwm::WindowManagerWayland::onSeatCapabilities(void* data, wl_seat* seat, uint32_t capabilities) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+
+    bool hasPointer = (capabilities & WL_SEAT_CAPABILITY_POINTER) != 0;
+    if (hasPointer && manager->_pointer == nullptr) {
+        manager->_pointer = wl_seat_get_pointer(seat);
+        if (manager->_pointer != nullptr) {
+            if (wl_pointer_add_listener(manager->_pointer, &kPointerListener, manager) != 0) {
+                JWM_LOG("Wayland: wl_pointer_add_listener failed");
+                manager->_resetPointer();
+            }
+        }
+    } else if (!hasPointer && manager->_pointer != nullptr) {
+        manager->_resetPointer();
+    }
+
+    bool hasKeyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
+    if (hasKeyboard && manager->_keyboard == nullptr) {
+        manager->_keyboard = wl_seat_get_keyboard(seat);
+        if (manager->_keyboard != nullptr) {
+            if (wl_keyboard_add_listener(manager->_keyboard, &kKeyboardListener, manager) != 0) {
+                JWM_LOG("Wayland: wl_keyboard_add_listener failed");
+                manager->_resetKeyboard();
+            }
+        }
+    } else if (!hasKeyboard && manager->_keyboard != nullptr) {
+        manager->_resetKeyboard();
+    }
+}
+
+void jwm::WindowManagerWayland::onSeatName(void* data, wl_seat* seat, const char* name) {
+    (void) data;
+    (void) seat;
+    (void) name;
+}
+
+void jwm::WindowManagerWayland::onPointerEnter(void* data, wl_pointer* pointer, uint32_t serial, wl_surface* surface, int32_t sx, int32_t sy) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+
+    WindowWayland* window = manager->_windowBySurface(surface);
+    manager->_pointerFocusWindow = window;
+    manager->_pointerEnterSerial = serial;
+
+    if (window == nullptr) {
+        return;
+    }
+
+    int previousX = manager->_pointerContentX;
+    int previousY = manager->_pointerContentY;
+    window->toContentPixels(wl_fixed_to_double(sx), wl_fixed_to_double(sy), manager->_pointerContentX, manager->_pointerContentY);
+
+    int movementX = manager->_pointerContentX - previousX;
+    int movementY = manager->_pointerContentY - previousY;
+    manager->_dispatchMouseMove(window, movementX, movementY);
+    manager->_applyCursorForFocus();
+}
+
+void jwm::WindowManagerWayland::onPointerLeave(void* data, wl_pointer* pointer, uint32_t serial, wl_surface* surface) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_flushPointerAxis();
+    manager->_pointerFocusWindow = nullptr;
+    manager->_pointerEnterSerial = 0;
+    manager->_pointerButtonMask = 0;
+}
+
+void jwm::WindowManagerWayland::onPointerMotion(void* data, wl_pointer* pointer, uint32_t time, int32_t sx, int32_t sy) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_pointerFocusWindow == nullptr) {
+        return;
+    }
+
+    int previousX = manager->_pointerContentX;
+    int previousY = manager->_pointerContentY;
+    manager->_pointerFocusWindow->toContentPixels(wl_fixed_to_double(sx), wl_fixed_to_double(sy), manager->_pointerContentX, manager->_pointerContentY);
+
+    int movementX = manager->_pointerContentX - previousX;
+    int movementY = manager->_pointerContentY - previousY;
+    manager->_dispatchMouseMove(manager->_pointerFocusWindow, movementX, movementY);
+}
+
+void jwm::WindowManagerWayland::onPointerButton(void* data, wl_pointer* pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_pointerFocusWindow == nullptr || !MouseButtonWayland::isButton(button)) {
+        return;
+    }
+
+    bool isPressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+    int buttonMask = MouseButtonWayland::maskForButton(button);
+    if (isPressed) {
+        manager->_pointerButtonMask |= buttonMask;
+    } else {
+        manager->_pointerButtonMask &= ~buttonMask;
+    }
+
+    manager->_dispatchMouseButton(manager->_pointerFocusWindow, MouseButtonWayland::fromNative(button), isPressed);
+}
+
+void jwm::WindowManagerWayland::onPointerAxis(void* data, wl_pointer* pointer, uint32_t time, uint32_t axis, int32_t value) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_pointerFocusWindow == nullptr) {
+        return;
+    }
+
+    double axisValue = wl_fixed_to_double(value);
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        manager->_pointerAxisX += axisValue;
+        manager->_pointerAxisPending = true;
+    } else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        manager->_pointerAxisY += axisValue;
+        manager->_pointerAxisPending = true;
+    }
+
+    uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(pointer));
+    if (version < WL_POINTER_FRAME_SINCE_VERSION) {
+        manager->_flushPointerAxis();
+    }
+}
+
+void jwm::WindowManagerWayland::onPointerFrame(void* data, wl_pointer* pointer) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_flushPointerAxis();
+}
+
+void jwm::WindowManagerWayland::onPointerAxisSource(void* data, wl_pointer* pointer, uint32_t axisSource) {
+    (void) data;
+    (void) pointer;
+    (void) axisSource;
+}
+
+void jwm::WindowManagerWayland::onPointerAxisStop(void* data, wl_pointer* pointer, uint32_t time, uint32_t axis) {
+    (void) pointer;
+    (void) time;
+    (void) axis;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_flushPointerAxis();
+}
+
+void jwm::WindowManagerWayland::onPointerAxisDiscrete(void* data, wl_pointer* pointer, uint32_t axis, int32_t discrete) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_pointerFocusWindow == nullptr) {
+        return;
+    }
+
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        manager->_pointerAxisDiscreteX += static_cast<double>(discrete);
+        manager->_pointerAxisDiscretePending = true;
+    } else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        manager->_pointerAxisDiscreteY += static_cast<double>(discrete);
+        manager->_pointerAxisDiscretePending = true;
+    }
+
+    uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(pointer));
+    if (version < WL_POINTER_FRAME_SINCE_VERSION) {
+        manager->_flushPointerAxis();
+    }
+}
+
+void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboard, uint32_t format, int32_t fd, uint32_t size) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+
+    if (fd < 0) {
+        return;
+    }
+
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || manager->_xkbContext == nullptr) {
+        close(fd);
+        return;
+    }
+
+    char* keymapData = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+    if (keymapData == MAP_FAILED) {
+        close(fd);
+        JWM_LOG("Wayland: mmap for keymap failed");
+        return;
+    }
+
+    xkb_keymap* keymap = xkb_keymap_new_from_string(
+        manager->_xkbContext,
+        keymapData,
+        XKB_KEYMAP_FORMAT_TEXT_V1,
+        XKB_KEYMAP_COMPILE_NO_FLAGS
+    );
+    munmap(keymapData, size);
+    close(fd);
+
+    if (keymap == nullptr) {
+        JWM_LOG("Wayland: xkb_keymap_new_from_string failed");
+        return;
+    }
+
+    xkb_state* state = xkb_state_new(keymap);
+    if (state == nullptr) {
+        JWM_LOG("Wayland: xkb_state_new failed");
+        xkb_keymap_unref(keymap);
+        return;
+    }
+
+    if (manager->_xkbState != nullptr) {
+        xkb_state_unref(manager->_xkbState);
+    }
+    if (manager->_xkbKeymap != nullptr) {
+        xkb_keymap_unref(manager->_xkbKeymap);
+    }
+
+    manager->_xkbKeymap = keymap;
+    manager->_xkbState = state;
+    manager->_xkbShiftMod = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_SHIFT);
+    manager->_xkbControlMod = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CTRL);
+    manager->_xkbAltMod = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_ALT);
+    manager->_xkbLogoMod = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_LOGO);
+    manager->_xkbCapsMod = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CAPS);
+    manager->_refreshKeyboardModifiers();
+}
+
+void jwm::WindowManagerWayland::onKeyboardEnter(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface, wl_array* keys) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    WindowWayland* window = manager->_windowBySurface(surface);
+    manager->_handleKeyboardFocusEnter(window, keys);
+}
+
+void jwm::WindowManagerWayland::onKeyboardLeave(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_handleKeyboardFocusLeave(true);
+}
+
+void jwm::WindowManagerWayland::onKeyboardKey(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t time, uint32_t keycode, uint32_t state) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    WindowWayland* window = manager->_keyboardFocusWindow;
+    if (window == nullptr) {
+        return;
+    }
+
+    bool isPressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+
+    Key key;
+    KeyLocation location;
+    int extraModifiers;
+    manager->_translateKeycode(keycode, key, location, extraModifiers);
+
+    if (isPressed) {
+        bool repeats = manager->_shouldRepeatKey(keycode);
+        manager->_pressedKeys[keycode] = PressedKeyState {
+            key,
+            location,
+            extraModifiers,
+            repeats
+        };
+
+        manager->_dispatchKey(window, keycode, true, key, location, extraModifiers, true);
+
+        if (repeats) {
+            manager->_scheduleRepeat(keycode, key, location, extraModifiers);
+        }
+        return;
+    }
+
+    auto pressedIt = manager->_pressedKeys.find(keycode);
+    if (pressedIt != manager->_pressedKeys.end()) {
+        key = pressedIt->second.key;
+        location = pressedIt->second.location;
+        extraModifiers = pressedIt->second.extraModifiers;
+        manager->_pressedKeys.erase(pressedIt);
+    }
+
+    manager->_dispatchKey(window, keycode, false, key, location, extraModifiers, false);
+    manager->_cancelRepeat(keycode);
+}
+
+void jwm::WindowManagerWayland::onKeyboardModifiers(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_xkbState == nullptr) {
+        return;
+    }
+
+    xkb_state_update_mask(manager->_xkbState, depressed, latched, locked, 0, 0, group);
+    manager->_refreshKeyboardModifiers();
+}
+
+void jwm::WindowManagerWayland::onKeyboardRepeatInfo(void* data, wl_keyboard* keyboard, int32_t rate, int32_t delay) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_repeatRate = std::max(rate, 0);
+    manager->_repeatDelay = std::max(delay, 0);
+
+    if (manager->_repeatRate <= 0) {
+        manager->_repeat.isActive = false;
+    }
 }

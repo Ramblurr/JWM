@@ -7,6 +7,7 @@
 #include <jni.h>
 
 #include "AppWayland.hh"
+#include "MouseCursor.hh"
 #include "Window.hh"
 #include "WindowManagerWayland.hh"
 
@@ -48,6 +49,8 @@ namespace jwm {
         wl_egl_window* getEglWindow() const;
         wl_surface* getSurface() const;
         uint64_t getEglWindowSerial() const;
+        void toContentPixels(double logicalX, double logicalY, int& x, int& y) const;
+        int toContentPixels(double logicalValue) const;
 
         WindowManagerWayland& getWindowManager();
 
@@ -109,5 +112,6 @@ namespace jwm {
 
         std::string _title;
         std::string _appId;
+        jwm::MouseCursor _mouseCursor = jwm::MouseCursor::ARROW;
     };
 }

@@ -302,6 +302,16 @@ uint64_t jwm::WindowWayland::getEglWindowSerial() const {
     return _eglWindowSerial;
 }
 
+void jwm::WindowWayland::toContentPixels(double logicalX, double logicalY, int& x, int& y) const {
+    x = toContentPixels(logicalX);
+    y = toContentPixels(logicalY);
+}
+
+int jwm::WindowWayland::toContentPixels(double logicalValue) const {
+    int scale = std::max(_bufferScale, 1);
+    return static_cast<int>(std::lround(logicalValue * static_cast<double>(scale)));
+}
+
 jwm::WindowManagerWayland& jwm::WindowWayland::getWindowManager() {
     return _windowManager;
 }
@@ -476,6 +486,7 @@ bool jwm::WindowWayland::_ensureSurface() {
             JWM_LOG("Wayland: wl_compositor_create_surface failed");
             return false;
         }
+        _windowManager.registerWindowSurface(_wlSurface, this);
         _bufferScale = _resolveBufferScale();
         wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
     }
@@ -682,6 +693,7 @@ void jwm::WindowWayland::_destroySurface() {
     _destroyShmBuffer();
     _destroyRoleObjects();
     if (_wlSurface != nullptr) {
+        _windowManager.unregisterWindowSurface(_wlSurface);
         wl_surface_destroy(_wlSurface);
         _wlSurface = nullptr;
     }
@@ -773,6 +785,12 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nS
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nSetMouseCursor
         (JNIEnv* env, jobject obj, jint cursorId) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    if (cursorId < 0 || cursorId >= static_cast<jint>(jwm::MouseCursor::COUNT)) {
+        return;
+    }
+    instance->_mouseCursor = static_cast<jwm::MouseCursor>(cursorId);
+    instance->getWindowManager().requestCursorUpdate(instance);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nMaximize
