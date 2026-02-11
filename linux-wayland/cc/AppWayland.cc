@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <vector>
 
+#include "AppWayland.hh"
 #include "WindowManagerWayland.hh"
 #include "impl/Library.hh"
 
@@ -11,11 +12,15 @@ namespace jwm {
             _jniEnv = env;
         }
 
-        void start() {
+        bool prepare() {
             if (!_windowManager.connect()) {
                 classes::Throwable::throwRuntimeException(_jniEnv, "Failed to initialize Wayland display connection");
-                return;
+                return false;
             }
+            return true;
+        }
+
+        void runLoop() {
             _windowManager.runLoop();
         }
 
@@ -34,7 +39,14 @@ namespace jwm {
             return _windowManager.getScreens();
         }
 
-    private:
+        WindowManagerWayland& getWindowManager() {
+            return _windowManager;
+        }
+
+        JNIEnv* getJniEnv() const {
+            return _jniEnv;
+        }
+
         JNIEnv* _jniEnv = nullptr;
         WindowManagerWayland _windowManager;
     } appWayland;
@@ -43,13 +55,24 @@ namespace jwm {
         IRect bounds = IRect::makeXYWH(0, 0, 1920, 1080);
         return classes::Screen::make(env, 1, true, bounds, bounds, 1.f);
     }
+
+    WindowManagerWayland& getWaylandWindowManager() {
+        return appWayland.getWindowManager();
+    }
+
+    JNIEnv* getWaylandJniEnv() {
+        return appWayland.getJniEnv();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_App__1nStart
         (JNIEnv* env, jclass cls, jobject launcher) {
     jwm::appWayland.init(env);
+    if (!jwm::appWayland.prepare()) {
+        return;
+    }
     jwm::classes::Runnable::run(env, launcher);
-    jwm::appWayland.start();
+    jwm::appWayland.runLoop();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_App__1nTerminate

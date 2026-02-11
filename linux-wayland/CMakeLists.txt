@@ -19,6 +19,9 @@ find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 set(XDG_OUTPUT_PROTOCOL_XML ${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-output-unstable-v1.xml)
 set(XDG_OUTPUT_PROTOCOL_HEADER ${GENERATED_DIR}/xdg-output-unstable-v1-client-protocol.hh)
 set(GENERATED_XDG_OUTPUT_PROTOCOL ${GENERATED_DIR}/xdg-output-unstable-v1-protocol.c)
+set(XDG_SHELL_PROTOCOL_XML ${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-shell.xml)
+set(XDG_SHELL_PROTOCOL_HEADER ${GENERATED_DIR}/xdg-shell-client-protocol.hh)
+set(GENERATED_XDG_SHELL_PROTOCOL ${GENERATED_DIR}/xdg-shell-protocol.c)
 
 add_custom_command(
     OUTPUT ${XDG_OUTPUT_PROTOCOL_HEADER}
@@ -36,13 +39,31 @@ add_custom_command(
     VERBATIM
 )
 
+add_custom_command(
+    OUTPUT ${XDG_SHELL_PROTOCOL_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+    COMMAND ${WAYLAND_SCANNER} client-header ${XDG_SHELL_PROTOCOL_XML} ${XDG_SHELL_PROTOCOL_HEADER}
+    DEPENDS ${XDG_SHELL_PROTOCOL_XML}
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${GENERATED_XDG_SHELL_PROTOCOL}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+    COMMAND ${WAYLAND_SCANNER} public-code ${XDG_SHELL_PROTOCOL_XML} ${GENERATED_XDG_SHELL_PROTOCOL}
+    DEPENDS ${XDG_SHELL_PROTOCOL_XML}
+    VERBATIM
+)
+
 add_custom_target(wayland-protocols-codegen
     DEPENDS
       ${XDG_OUTPUT_PROTOCOL_HEADER}
       ${GENERATED_XDG_OUTPUT_PROTOCOL}
+      ${XDG_SHELL_PROTOCOL_HEADER}
+      ${GENERATED_XDG_SHELL_PROTOCOL}
 )
 
-add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL} ${GENERATED_XDG_OUTPUT_PROTOCOL})
+add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL} ${GENERATED_XDG_OUTPUT_PROTOCOL} ${GENERATED_XDG_SHELL_PROTOCOL})
 add_dependencies(jwm wayland-protocols-codegen)
 find_library(WAYLAND_CLIENT_LIB wayland-client HINTS ENV LD_LIBRARY_PATH REQUIRED)
 

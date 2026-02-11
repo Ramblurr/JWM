@@ -86,7 +86,7 @@ public class Example implements Consumer<Event> {
                 window.setIcon(new File("examples/dashboard/resources/macos.icns"));
             }
             case X11 -> {
-                ((WindowX11) window).setClassHint("jwm-dashboard-example"); // allows OS-wide identification of the window (e.g. icon themes, .desktop files)
+                ((WindowX11) window).setClassHint("jwm-example-dashboard"); // allows OS-wide identification of the window (e.g. icon themes, .desktop files)
                 try {
                     Bitmap i = Bitmap.makeFromImage(Image.makeDeferredFromEncodedBytes(Files.readAllBytes(Path.of("examples/dashboard/resources/linux/icon_48x48.png"))));
                     ImageInfo info = i.getImageInfo();
@@ -97,6 +97,7 @@ public class Example implements Consumer<Event> {
                 }
             }
             case WAYLAND -> {
+                ((WindowWayland) window).setAppId("jwm-example-dashboard");
             }
         }
 

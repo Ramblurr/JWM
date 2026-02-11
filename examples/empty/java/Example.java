@@ -15,6 +15,9 @@ public class Example implements Consumer<Event> {
         window = App.makeWindow();
         window.setEventListener(this);
         window.setTitle("Empty");
+        if (window instanceof WindowWayland windowWayland) {
+            windowWayland.setAppId("jwm-example-empty");
+        }
         window.setLayer(new LayerGLSkija());
 
         var screen = App.getPrimaryScreen();

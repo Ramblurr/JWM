@@ -13,6 +13,7 @@
 #include <wayland-client.h>
 
 #include "Log.hh"
+#include "xdg-shell-client-protocol.hh"
 #include "xdg-output-unstable-v1-client-protocol.hh"
 
 namespace {
@@ -34,6 +35,10 @@ namespace {
         &jwm::WindowManagerWayland::onXdgOutputDone,
         &jwm::WindowManagerWayland::onXdgOutputName,
         &jwm::WindowManagerWayland::onXdgOutputDescription
+    };
+
+    xdg_wm_base_listener kXdgWmBaseListener {
+        &jwm::WindowManagerWayland::onXdgWmBasePing
     };
 }
 
@@ -62,10 +67,10 @@ jwm::WindowManagerWayland::WindowManagerWayland() {
 }
 
 jwm::WindowManagerWayland::~WindowManagerWayland() {
-    cleanup();
+    _cleanup();
 }
 
-bool jwm::WindowManagerWayland::initializeNotifyPipe() {
+bool jwm::WindowManagerWayland::_initializeNotifyPipe() {
     int pipes[2];
     if (pipe(pipes) != 0) {
         JWM_LOG("Wayland: failed to create notify pipe: " << strerror(errno));
@@ -92,44 +97,50 @@ bool jwm::WindowManagerWayland::connect() {
         return false;
     }
 
-    if (!initializeNotifyPipe()) {
-        cleanup();
+    if (!_initializeNotifyPipe()) {
+        _cleanup();
         return false;
     }
 
     _registry = wl_display_get_registry(_display);
     if (_registry == nullptr) {
         JWM_LOG("Wayland: wl_display_get_registry failed");
-        cleanup();
+        _cleanup();
         return false;
     }
 
     if (wl_registry_add_listener(_registry, &kRegistryListener, this) != 0) {
         JWM_LOG("Wayland: wl_registry_add_listener failed");
-        cleanup();
+        _cleanup();
         return false;
     }
 
     if (wl_display_roundtrip(_display) < 0) {
         JWM_LOG("Wayland: initial registry roundtrip failed");
-        cleanup();
+        _cleanup();
         return false;
     }
 
     // A second roundtrip lets wl_output listeners deliver geometry/mode/scale updates.
     if (wl_display_roundtrip(_display) < 0) {
         JWM_LOG("Wayland: initial output roundtrip failed");
-        cleanup();
+        _cleanup();
+        return false;
+    }
+
+    if (_compositor == nullptr || _xdgWmBase == nullptr || _shm == nullptr) {
+        JWM_LOG("Wayland: required globals missing (wl_compositor, xdg_wm_base, or wl_shm)");
+        _cleanup();
         return false;
     }
 
     return true;
 }
 
-void jwm::WindowManagerWayland::cleanup() {
+void jwm::WindowManagerWayland::_cleanup() {
     _runLoop = false;
 
-    clearXdgOutputBindings();
+    _clearXdgOutputBindings();
 
     for (auto& outputPair : _outputByName) {
         if (outputPair.second->output != nullptr) {
@@ -143,6 +154,25 @@ void jwm::WindowManagerWayland::cleanup() {
         _xdgOutputManager = nullptr;
     }
     _xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
+
+    if (_xdgWmBase != nullptr) {
+        xdg_wm_base_destroy(_xdgWmBase);
+        _xdgWmBase = nullptr;
+    }
+    _xdgWmBaseName = std::numeric_limits<uint32_t>::max();
+
+    if (_shm != nullptr) {
+        wl_shm_destroy(_shm);
+        _shm = nullptr;
+    }
+    _shmName = std::numeric_limits<uint32_t>::max();
+
+    if (_compositor != nullptr) {
+        wl_compositor_destroy(_compositor);
+        _compositor = nullptr;
+    }
+    _compositorName = std::numeric_limits<uint32_t>::max();
+    _compositorVersion = 0;
 
     if (_registry != nullptr) {
         wl_registry_destroy(_registry);
@@ -176,7 +206,7 @@ void jwm::WindowManagerWayland::cleanup() {
     }
 }
 
-void jwm::WindowManagerWayland::rebuildScreens() {
+void jwm::WindowManagerWayland::_rebuildScreens() {
     std::vector<ScreenInfoWayland> screens;
     screens.reserve(_outputByName.size());
     for (const auto& outputPair : _outputByName) {
@@ -223,7 +253,7 @@ void jwm::WindowManagerWayland::rebuildScreens() {
     }
 }
 
-void jwm::WindowManagerWayland::clearXdgOutputBindings() {
+void jwm::WindowManagerWayland::_clearXdgOutputBindings() {
     for (auto& outputPair : _outputByName) {
         WaylandOutputState& outputState = *outputPair.second;
         if (outputState.xdgOutput != nullptr) {
@@ -241,7 +271,7 @@ void jwm::WindowManagerWayland::clearXdgOutputBindings() {
     }
 }
 
-bool jwm::WindowManagerWayland::bindXdgOutputManager(wl_registry* registry, uint32_t name, uint32_t version) {
+bool jwm::WindowManagerWayland::_bindXdgOutputManager(wl_registry* registry, uint32_t name, uint32_t version) {
     if (_xdgOutputManager != nullptr) {
         return true;
     }
@@ -255,12 +285,12 @@ bool jwm::WindowManagerWayland::bindXdgOutputManager(wl_registry* registry, uint
     _xdgOutputManagerName = name;
 
     for (auto& outputPair : _outputByName) {
-        bindXdgOutputForOutput(*outputPair.second);
+        _bindXdgOutputForOutput(*outputPair.second);
     }
     return true;
 }
 
-void jwm::WindowManagerWayland::bindXdgOutputForOutput(WaylandOutputState& outputState) {
+void jwm::WindowManagerWayland::_bindXdgOutputForOutput(WaylandOutputState& outputState) {
     if (_xdgOutputManager == nullptr || outputState.output == nullptr || outputState.xdgOutput != nullptr) {
         return;
     }
@@ -276,12 +306,89 @@ void jwm::WindowManagerWayland::bindXdgOutputForOutput(WaylandOutputState& outpu
     }
 }
 
+bool jwm::WindowManagerWayland::_bindCompositor(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_compositor != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 6u);
+    _compositor = static_cast<wl_compositor*>(wl_registry_bind(registry, name, &wl_compositor_interface, bindVersion));
+    if (_compositor == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wl_compositor) failed");
+        return false;
+    }
+    _compositorName = name;
+    _compositorVersion = bindVersion;
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindShm(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_shm != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, bindVersion));
+    if (_shm == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wl_shm) failed");
+        return false;
+    }
+    _shmName = name;
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindXdgWmBase(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_xdgWmBase != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _xdgWmBase = static_cast<xdg_wm_base*>(wl_registry_bind(registry, name, &xdg_wm_base_interface, bindVersion));
+    if (_xdgWmBase == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(xdg_wm_base) failed");
+        return false;
+    }
+    _xdgWmBaseName = name;
+    if (xdg_wm_base_add_listener(_xdgWmBase, &kXdgWmBaseListener, this) != 0) {
+        JWM_LOG("Wayland: xdg_wm_base_add_listener failed");
+        xdg_wm_base_destroy(_xdgWmBase);
+        _xdgWmBase = nullptr;
+        _xdgWmBaseName = std::numeric_limits<uint32_t>::max();
+        return false;
+    }
+    return true;
+}
+
+wl_display* jwm::WindowManagerWayland::getDisplay() const {
+    return _display;
+}
+
+wl_compositor* jwm::WindowManagerWayland::getCompositor() const {
+    return _compositor;
+}
+
+wl_shm* jwm::WindowManagerWayland::getShm() const {
+    return _shm;
+}
+
+xdg_wm_base* jwm::WindowManagerWayland::getXdgWmBase() const {
+    return _xdgWmBase;
+}
+
+uint32_t jwm::WindowManagerWayland::getCompositorVersion() const {
+    return _compositorVersion;
+}
+
+bool jwm::WindowManagerWayland::isReadyForWindows() const {
+    return _display != nullptr && _compositor != nullptr && _xdgWmBase != nullptr && _shm != nullptr;
+}
+
 std::vector<jwm::ScreenInfoWayland> jwm::WindowManagerWayland::getScreens() const {
     std::lock_guard<std::mutex> lock(_screensLock);
     return _screens;
 }
 
-void jwm::WindowManagerWayland::notifyLoop() {
+void jwm::WindowManagerWayland::_notifyLoop() {
     if (_notifyWriteFd < 0) {
         return;
     }
@@ -292,7 +399,7 @@ void jwm::WindowManagerWayland::notifyLoop() {
     }
 }
 
-void jwm::WindowManagerWayland::drainNotifyPipe() {
+void jwm::WindowManagerWayland::_drainNotifyPipe() {
     char buffer[64];
     while (true) {
         ssize_t readCount = read(_notifyReadFd, buffer, sizeof(buffer));
@@ -311,10 +418,10 @@ void jwm::WindowManagerWayland::enqueueTask(std::function<void()> task) {
         std::lock_guard<std::mutex> lock(_taskQueueLock);
         _taskQueue.push(std::move(task));
     }
-    notifyLoop();
+    _notifyLoop();
 }
 
-void jwm::WindowManagerWayland::processTasks() {
+void jwm::WindowManagerWayland::_processTasks() {
     std::unique_lock<std::mutex> lock(_taskQueueLock);
     while (!_taskQueue.empty()) {
         auto callback = std::move(_taskQueue.front());
@@ -333,20 +440,20 @@ void jwm::WindowManagerWayland::runLoop() {
     int displayFd = wl_display_get_fd(_display);
     if (displayFd < 0) {
         JWM_LOG("Wayland: wl_display_get_fd failed");
-        cleanup();
+        _cleanup();
         return;
     }
 
     _runLoop = true;
     while (_runLoop) {
-        processTasks();
+        _processTasks();
 
         while (wl_display_prepare_read(_display) != 0) {
             if (wl_display_dispatch_pending(_display) < 0) {
                 _runLoop = false;
                 break;
             }
-            processTasks();
+            _processTasks();
         }
         if (!_runLoop) {
             break;
@@ -388,7 +495,7 @@ void jwm::WindowManagerWayland::runLoop() {
         }
 
         if ((events[1].revents & POLLIN) != 0) {
-            drainNotifyPipe();
+            _drainNotifyPipe();
         }
         _notifyPending.store(false);
 
@@ -398,19 +505,31 @@ void jwm::WindowManagerWayland::runLoop() {
         }
     }
 
-    processTasks();
-    cleanup();
+    _processTasks();
+    _cleanup();
 }
 
 void jwm::WindowManagerWayland::terminate() {
     _runLoop = false;
-    notifyLoop();
+    _notifyLoop();
 }
 
 void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        manager->_bindCompositor(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, wl_shm_interface.name) == 0) {
+        manager->_bindShm(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        manager->_bindXdgWmBase(registry, name, version);
+        return;
+    }
     if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
-        manager->bindXdgOutputManager(registry, name, version);
+        manager->_bindXdgOutputManager(registry, name, version);
         return;
     }
     if (strcmp(interface, wl_output_interface.name) != 0) {
@@ -435,20 +554,44 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
         return;
     }
 
-    manager->bindXdgOutputForOutput(*outputState);
+    manager->_bindXdgOutputForOutput(*outputState);
     manager->_outputByName[name] = std::move(outputState);
 }
 
 void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* registry, uint32_t name) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (name == manager->_compositorName) {
+        if (manager->_compositor != nullptr) {
+            wl_compositor_destroy(manager->_compositor);
+            manager->_compositor = nullptr;
+        }
+        manager->_compositorName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
+    if (name == manager->_xdgWmBaseName) {
+        if (manager->_xdgWmBase != nullptr) {
+            xdg_wm_base_destroy(manager->_xdgWmBase);
+            manager->_xdgWmBase = nullptr;
+        }
+        manager->_xdgWmBaseName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
+    if (name == manager->_shmName) {
+        if (manager->_shm != nullptr) {
+            wl_shm_destroy(manager->_shm);
+            manager->_shm = nullptr;
+        }
+        manager->_shmName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
     if (name == manager->_xdgOutputManagerName) {
-        manager->clearXdgOutputBindings();
+        manager->_clearXdgOutputBindings();
         if (manager->_xdgOutputManager != nullptr) {
             zxdg_output_manager_v1_destroy(manager->_xdgOutputManager);
             manager->_xdgOutputManager = nullptr;
         }
         manager->_xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
-        manager->rebuildScreens();
+        manager->_rebuildScreens();
         return;
     }
     auto outputIt = manager->_outputByName.find(name);
@@ -461,14 +604,14 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
     }
     wl_output_destroy(outputIt->second->output);
     manager->_outputByName.erase(outputIt);
-    manager->rebuildScreens();
+    manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onOutputGeometry(void* data, wl_output* output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char* make, const char* model, int32_t transform) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->x = x;
     outputState->y = y;
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onOutputMode(void* data, wl_output* output, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
@@ -478,18 +621,18 @@ void jwm::WindowManagerWayland::onOutputMode(void* data, wl_output* output, uint
         outputState->height = height;
         outputState->hasMode = true;
     }
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onOutputDone(void* data, wl_output* output) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onOutputScale(void* data, wl_output* output, int32_t factor) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->scale = std::max(1, factor);
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_output_v1* xdgOutput, int32_t x, int32_t y) {
@@ -497,7 +640,7 @@ void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_outp
     outputState->logicalX = x;
     outputState->logicalY = y;
     outputState->hasLogicalPosition = true;
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalSize(void* data, zxdg_output_v1* xdgOutput, int32_t width, int32_t height) {
@@ -505,22 +648,27 @@ void jwm::WindowManagerWayland::onXdgOutputLogicalSize(void* data, zxdg_output_v
     outputState->logicalWidth = width;
     outputState->logicalHeight = height;
     outputState->hasLogicalSize = true;
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputDone(void* data, zxdg_output_v1* xdgOutput) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputName(void* data, zxdg_output_v1* xdgOutput, const char* name) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->xdgName = name != nullptr ? name : "";
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputDescription(void* data, zxdg_output_v1* xdgOutput, const char* description) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->xdgDescription = description != nullptr ? description : "";
-    outputState->manager->rebuildScreens();
+    outputState->manager->_rebuildScreens();
+}
+
+void jwm::WindowManagerWayland::onXdgWmBasePing(void* data, xdg_wm_base* xdgWmBase, uint32_t serial) {
+    (void) data;
+    xdg_wm_base_pong(xdgWmBase, serial);
 }
