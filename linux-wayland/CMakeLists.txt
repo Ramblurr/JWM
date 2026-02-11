@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
-project(jwm LANGUAGES CXX)
+project(jwm LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -12,9 +12,38 @@ if(NOT JWM_ARCH)
     endif()
 endif()
 
-file(GLOB SOURCES_CXX ${CMAKE_CURRENT_LIST_DIR}/../shared/cc/*.cc ${CMAKE_CURRENT_LIST_DIR}/cc/*.cc)
+file(GLOB SOURCES_CXX ${CMAKE_CURRENT_LIST_DIR}/../shared/cc/*.cc ${CMAKE_CURRENT_LIST_DIR}/cc/*.cc ${CMAKE_CURRENT_LIST_DIR}/cc/*.c)
 file(GLOB SOURCES_CXX_IMPL ${CMAKE_CURRENT_LIST_DIR}/../shared/cc/impl/*.cc)
-add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL})
+set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
+set(XDG_OUTPUT_PROTOCOL_XML ${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-output-unstable-v1.xml)
+set(XDG_OUTPUT_PROTOCOL_HEADER ${GENERATED_DIR}/xdg-output-unstable-v1-client-protocol.hh)
+set(GENERATED_XDG_OUTPUT_PROTOCOL ${GENERATED_DIR}/xdg-output-unstable-v1-protocol.c)
+
+add_custom_command(
+    OUTPUT ${XDG_OUTPUT_PROTOCOL_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+    COMMAND ${WAYLAND_SCANNER} client-header ${XDG_OUTPUT_PROTOCOL_XML} ${XDG_OUTPUT_PROTOCOL_HEADER}
+    DEPENDS ${XDG_OUTPUT_PROTOCOL_XML}
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${GENERATED_XDG_OUTPUT_PROTOCOL}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+    COMMAND ${WAYLAND_SCANNER} public-code ${XDG_OUTPUT_PROTOCOL_XML} ${GENERATED_XDG_OUTPUT_PROTOCOL}
+    DEPENDS ${XDG_OUTPUT_PROTOCOL_XML}
+    VERBATIM
+)
+
+add_custom_target(wayland-protocols-codegen
+    DEPENDS
+      ${XDG_OUTPUT_PROTOCOL_HEADER}
+      ${GENERATED_XDG_OUTPUT_PROTOCOL}
+)
+
+add_library(jwm SHARED ${SOURCES_OBJC} ${SOURCES_CXX} ${SOURCES_CXX_IMPL} ${GENERATED_XDG_OUTPUT_PROTOCOL})
+add_dependencies(jwm wayland-protocols-codegen)
 find_library(WAYLAND_CLIENT_LIB wayland-client HINTS ENV LD_LIBRARY_PATH REQUIRED)
 
 set(JAVA_HOME $ENV{JAVA_HOME})
@@ -28,6 +57,6 @@ if (NOT JAVA_HOME)
     endif()
 endif()
 
-target_include_directories(jwm PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../shared/cc ${JAVA_HOME}/include ${JAVA_HOME}/include/linux)
+target_include_directories(jwm PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../shared/cc ${JAVA_HOME}/include ${JAVA_HOME}/include/linux ${GENERATED_DIR})
 set_target_properties(jwm PROPERTIES OUTPUT_NAME "jwm_wayland_${JWM_ARCH}")
 target_link_libraries(jwm PRIVATE ${WAYLAND_CLIENT_LIB})
