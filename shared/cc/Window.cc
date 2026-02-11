@@ -5,7 +5,33 @@
 #include "impl/Library.hh"
 
 jwm::Window::~Window() {
-    fEnv->DeleteGlobalRef(fWindow);
+    if (fWindow == nullptr) {
+        return;
+    }
+
+    JNIEnv* env = fEnv;
+    bool didAttach = false;
+    if (fJvm != nullptr) {
+        JNIEnv* currentEnv = nullptr;
+        jint status = fJvm->GetEnv(reinterpret_cast<void**>(&currentEnv), JNI_VERSION_1_2);
+        if (status == JNI_OK) {
+            env = currentEnv;
+        } else if (status == JNI_EDETACHED) {
+            if (fJvm->AttachCurrentThread(reinterpret_cast<void**>(&currentEnv), nullptr) == JNI_OK) {
+                env = currentEnv;
+                didAttach = true;
+            }
+        }
+    }
+
+    if (env != nullptr) {
+        env->DeleteGlobalRef(fWindow);
+    }
+    fWindow = nullptr;
+
+    if (didAttach && fJvm != nullptr) {
+        fJvm->DetachCurrentThread();
+    }
 }
 
 void jwm::Window::dispatch(jobject event) {
