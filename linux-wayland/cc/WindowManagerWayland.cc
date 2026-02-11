@@ -223,12 +223,7 @@ void jwm::WindowManagerWayland::_rebuildScreens() {
             continue;
         }
 
-        float outputScale = static_cast<float>(output.scale);
-        if (output.hasLogicalSize && output.logicalWidth > 0 && output.logicalHeight > 0) {
-            float widthScale = static_cast<float>(output.width) / static_cast<float>(output.logicalWidth);
-            float heightScale = static_cast<float>(output.height) / static_cast<float>(output.logicalHeight);
-            outputScale = std::max(widthScale, heightScale);
-        }
+        float outputScale = static_cast<float>(std::max(1, output.scale));
 
         ScreenInfoWayland screenInfo = {
             static_cast<long>(output.name),

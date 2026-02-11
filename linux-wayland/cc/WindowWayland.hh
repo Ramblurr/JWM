@@ -12,6 +12,7 @@
 
 struct wl_buffer;
 struct wl_callback;
+struct wl_egl_window;
 struct wl_surface;
 struct wl_array;
 struct xdg_surface;
@@ -39,7 +40,14 @@ namespace jwm {
 
         void requestFrame();
         bool isReadyForRasterPresent() const;
+        bool isReadyForEglPresent() const;
         bool presentBuffer(wl_buffer* buffer, int width, int height);
+        bool ensureEglWindow(int width, int height);
+        void resizeEglWindow(int width, int height);
+        int getBufferScale() const;
+        wl_egl_window* getEglWindow() const;
+        wl_surface* getSurface() const;
+        uint64_t getEglWindowSerial() const;
 
         WindowManagerWayland& getWindowManager();
 
@@ -47,21 +55,31 @@ namespace jwm {
         static void onXdgToplevelConfigure(void* data, xdg_toplevel* xdgToplevel, int32_t width, int32_t height, wl_array* states);
         static void onXdgToplevelClose(void* data, xdg_toplevel* xdgToplevel);
         static void onFrameDone(void* data, wl_callback* callback, uint32_t callbackData);
+        static void onShowHideSyncDone(void* data, wl_callback* callback, uint32_t callbackData);
 
         void _handleXdgSurfaceConfigure(uint32_t serial);
         void _handleXdgToplevelConfigure(int32_t width, int32_t height);
         void _handleFrameDone(wl_callback* callback);
         bool _armFrameCallbackIfNeeded();
         bool _ensureSurface();
+        void _waitForShowHideSyncIfNeeded();
+        void _queueShowHideSync();
+        int _resolveBufferScale() const;
+        int _toBufferPixels(int logicalValue) const;
         bool _ensureShmBuffer(int width, int height);
+        void _destroyShowHideSyncCallback();
+        void _destroyEglWindow();
         void _destroyFrameCallback();
         void _destroyShmBuffer();
+        void _destroyRoleObjects();
         void _destroySurface();
 
         WindowManagerWayland& _windowManager;
         wl_surface* _wlSurface = nullptr;
+        wl_egl_window* _wlEglWindow = nullptr;
         wl_buffer* _wlBuffer = nullptr;
         wl_callback* _wlFrameCallback = nullptr;
+        wl_callback* _showHideSyncCallback = nullptr;
         xdg_surface* _xdgSurface = nullptr;
         xdg_toplevel* _xdgToplevel = nullptr;
 
@@ -70,17 +88,23 @@ namespace jwm {
         size_t _bufferByteCount = 0;
         int _bufferWidth = 0;
         int _bufferHeight = 0;
+        int _eglWindowWidth = 0;
+        int _eglWindowHeight = 0;
+        uint64_t _eglWindowSerial = 0;
 
         IRect _windowRect = IRect::makeXYWH(0, 0, 800, 600);
         IRect _contentRect = IRect::makeXYWH(0, 0, 800, 600);
+        IRect _logicalContentRect = IRect::makeXYWH(0, 0, 800, 600);
         int32_t _pendingWidth = 800;
         int32_t _pendingHeight = 600;
+        int _bufferScale = 1;
 
         bool _isVisible = false;
         bool _isConfigured = false;
         bool _isFullScreen = false;
         bool _isClosed = false;
         bool _isFrameRequested = false;
+        bool _showHideSyncRequired = false;
 
         std::string _title;
         std::string _appId;
