@@ -75,12 +75,6 @@ namespace jwm {
             IRect contentRect = _window->getContentRect();
             _width = contentRect.getWidth();
             _height = contentRect.getHeight();
-            if (!_createOrUpdateSurface()) {
-                throw std::runtime_error("failed to create EGL window surface");
-            }
-
-            makeCurrent();
-            setVsyncMode(kVsyncAdaptive);
         }
 
         void reconfigure() {
@@ -92,16 +86,31 @@ namespace jwm {
         }
 
         void makeCurrent() {
+            _makeCurrentInternal();
+        }
+
+        bool _makeCurrentInternal() {
             if (_window == nullptr || _eglDisplay == EGL_NO_DISPLAY || _eglContext == EGL_NO_CONTEXT) {
-                return;
+                return false;
+            }
+            if (!_window->isReadyForRasterPresent()) {
+                return false;
             }
             if (!_createOrUpdateSurface()) {
-                return;
+                return false;
             }
             if (!eglMakeCurrent(_eglDisplay, _eglSurface, _eglSurface, _eglContext)) {
                 EGLint error = eglGetError();
                 JWM_LOG("Wayland EGL: eglMakeCurrent failed: " << _eglErrorToString(error));
+                return false;
             }
+
+            // Configure swap interval only after the context/surface are current.
+            if (!_vsyncConfigured) {
+                setVsyncMode(kVsyncAdaptive);
+                _vsyncConfigured = true;
+            }
+            return true;
         }
 
         void resize(int width, int height) {
@@ -111,12 +120,17 @@ namespace jwm {
             if (_window == nullptr) {
                 return;
             }
+            if (!_window->isReadyForRasterPresent()) {
+                return;
+            }
 
             if (!_createOrUpdateSurface()) {
                 return;
             }
 
-            makeCurrent();
+            if (!_makeCurrentInternal()) {
+                return;
+            }
             glClearStencil(0);
             glClearColor(0.f, 0.f, 0.f, 1.f);
             glStencilMask(0xffffffffu);
@@ -129,6 +143,9 @@ namespace jwm {
                 return;
             }
             if (!_window->isReadyForEglPresent()) {
+                return;
+            }
+            if (!_makeCurrentInternal()) {
                 return;
             }
             if (!_createOrUpdateSurface()) {
@@ -161,6 +178,7 @@ namespace jwm {
 
             _width = 0;
             _height = 0;
+            _vsyncConfigured = false;
         }
 
         void setVsyncMode(int mode) {
@@ -220,12 +238,11 @@ namespace jwm {
                 return false;
             }
 
+            // LayerGLSkija expects a desktop OpenGL context.
             if (!_createContextForApi(EGL_OPENGL_API, EGL_OPENGL_BIT, false)) {
-                if (!_createContextForApi(EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, true)) {
-                    eglTerminate(_eglDisplay);
-                    _eglDisplay = EGL_NO_DISPLAY;
-                    return false;
-                }
+                eglTerminate(_eglDisplay);
+                _eglDisplay = EGL_NO_DISPLAY;
+                return false;
             }
 
             return true;
@@ -279,6 +296,9 @@ namespace jwm {
 
         bool _createOrUpdateSurface() {
             if (_window == nullptr || _eglDisplay == EGL_NO_DISPLAY || _eglContext == EGL_NO_CONTEXT || _eglConfig == nullptr) {
+                return false;
+            }
+            if (!_window->isReadyForRasterPresent()) {
                 return false;
             }
 
@@ -341,6 +361,7 @@ namespace jwm {
         int _height = 0;
         EglGetPlatformDisplayExtProc _eglGetPlatformDisplayExt = nullptr;
         EglCreatePlatformWindowSurfaceExtProc _eglCreatePlatformWindowSurfaceExt = nullptr;
+        bool _vsyncConfigured = false;
     };
 }
 

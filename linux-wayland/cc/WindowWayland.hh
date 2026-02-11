@@ -98,6 +98,7 @@ namespace jwm {
         int32_t _pendingWidth = 800;
         int32_t _pendingHeight = 600;
         int _bufferScale = 1;
+        uint32_t _lastConfigureSerial = 0;
 
         bool _isVisible = false;
         bool _isConfigured = false;

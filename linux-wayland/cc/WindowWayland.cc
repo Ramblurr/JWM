@@ -344,7 +344,13 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
         return;
     }
 
+    // Ignore exact duplicate configure serials; each serial should be handled once.
+    if (_lastConfigureSerial != 0 && serial == _lastConfigureSerial) {
+        return;
+    }
+
     xdg_surface_ack_configure(_xdgSurface, serial);
+    _lastConfigureSerial = serial;
 
     int width = _pendingWidth > 0 ? _pendingWidth : _logicalContentRect.getWidth();
     int height = _pendingHeight > 0 ? _pendingHeight : _logicalContentRect.getHeight();
@@ -392,14 +398,17 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
     _armFrameCallbackIfNeeded();
     wl_surface_commit(_wlSurface);
 
-    if (width != previousWindowWidth || height != previousWindowHeight ||
-            contentWidth != previousContentWidth || contentHeight != previousContentHeight) {
+    bool sizeChanged = width != previousWindowWidth || height != previousWindowHeight ||
+        contentWidth != previousContentWidth || contentHeight != previousContentHeight;
+
+    if (sizeChanged) {
         JNILocal<jobject> eventWindowResize(fEnv,
             classes::EventWindowResize::make(fEnv, width, height, contentWidth, contentHeight));
         dispatch(eventWindowResize.get());
     }
 
-    if (dispatchInitialFrame && !_isClosed && _isVisible) {
+    // schedule an immediate redraw on configure/resize so compositors can apply the newly configured geometry with a fresh buffer.
+    if ((dispatchInitialFrame || sizeChanged) && !_isClosed && _isVisible) {
         dispatch(classes::EventFrame::kInstance);
     }
 }
@@ -679,6 +688,7 @@ void jwm::WindowWayland::_destroySurface() {
 }
 
 void jwm::WindowWayland::_destroyRoleObjects() {
+    _lastConfigureSerial = 0;
     if (_xdgToplevel != nullptr) {
         xdg_toplevel_destroy(_xdgToplevel);
         _xdgToplevel = nullptr;
