@@ -83,6 +83,8 @@ namespace jwm {
         static void onPointerAxisSource(void* data, wl_pointer* pointer, uint32_t axisSource);
         static void onPointerAxisStop(void* data, wl_pointer* pointer, uint32_t time, uint32_t axis);
         static void onPointerAxisDiscrete(void* data, wl_pointer* pointer, uint32_t axis, int32_t discrete);
+        static void onPointerAxisValue120(void* data, wl_pointer* pointer, uint32_t axis, int32_t value120);
+        static void onPointerAxisRelativeDirection(void* data, wl_pointer* pointer, uint32_t axis, uint32_t direction);
         static void onKeyboardKeymap(void* data, wl_keyboard* keyboard, uint32_t format, int32_t fd, uint32_t size);
         static void onKeyboardEnter(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface, wl_array* keys);
         static void onKeyboardLeave(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface);
@@ -161,10 +163,13 @@ namespace jwm {
         int _pointerButtonMask = 0;
         bool _pointerAxisPending = false;
         bool _pointerAxisDiscretePending = false;
+        bool _pointerAxisValue120Pending = false;
         double _pointerAxisX = 0.0;
         double _pointerAxisY = 0.0;
         double _pointerAxisDiscreteX = 0.0;
         double _pointerAxisDiscreteY = 0.0;
+        double _pointerAxisValue120X = 0.0;
+        double _pointerAxisValue120Y = 0.0;
 
         xkb_context* _xkbContext = nullptr;
         xkb_keymap* _xkbKeymap = nullptr;

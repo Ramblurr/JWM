@@ -67,7 +67,11 @@ namespace {
         &jwm::WindowManagerWayland::onPointerFrame,
         &jwm::WindowManagerWayland::onPointerAxisSource,
         &jwm::WindowManagerWayland::onPointerAxisStop,
-        &jwm::WindowManagerWayland::onPointerAxisDiscrete
+        &jwm::WindowManagerWayland::onPointerAxisDiscrete,
+#if defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+        &jwm::WindowManagerWayland::onPointerAxisValue120,
+        &jwm::WindowManagerWayland::onPointerAxisRelativeDirection
+#endif
     };
 
     wl_keyboard_listener kKeyboardListener {
@@ -208,10 +212,13 @@ void jwm::WindowManagerWayland::_resetPointer() {
     _pointerButtonMask = 0;
     _pointerAxisPending = false;
     _pointerAxisDiscretePending = false;
+    _pointerAxisValue120Pending = false;
     _pointerAxisX = 0.0;
     _pointerAxisY = 0.0;
     _pointerAxisDiscreteX = 0.0;
     _pointerAxisDiscreteY = 0.0;
+    _pointerAxisValue120X = 0.0;
+    _pointerAxisValue120Y = 0.0;
     _pointerButtonMask = 0;
 
     if (_cursorSurface != nullptr) {
@@ -579,10 +586,13 @@ void jwm::WindowManagerWayland::unregisterWindowSurface(wl_surface* surface) {
         _pointerButtonMask = 0;
         _pointerAxisPending = false;
         _pointerAxisDiscretePending = false;
+        _pointerAxisValue120Pending = false;
         _pointerAxisX = 0.0;
         _pointerAxisY = 0.0;
         _pointerAxisDiscreteX = 0.0;
         _pointerAxisDiscreteY = 0.0;
+        _pointerAxisValue120X = 0.0;
+        _pointerAxisValue120Y = 0.0;
     }
     if (_keyboardFocusWindow == window && !_isHandlingKeyboardFocusLeave) {
         _handleKeyboardFocusLeave(false);
@@ -1152,7 +1162,7 @@ void jwm::WindowManagerWayland::_dispatchMouseScroll(WindowWayland* window, floa
 }
 
 void jwm::WindowManagerWayland::_flushPointerAxis() {
-    if (!_pointerAxisPending && !_pointerAxisDiscretePending) {
+    if (!_pointerAxisPending && !_pointerAxisDiscretePending && !_pointerAxisValue120Pending) {
         return;
     }
 
@@ -1162,6 +1172,13 @@ void jwm::WindowManagerWayland::_flushPointerAxis() {
         float deltaY = static_cast<float>(-_pointerAxisY * kPixelsPerScroll);
         float deltaChars = static_cast<float>(-_pointerAxisDiscreteX);
         float deltaLines = static_cast<float>(-_pointerAxisDiscreteY);
+
+        if (_pointerAxisValue120X != 0.0) {
+            deltaChars = static_cast<float>(-_pointerAxisValue120X / 120.0);
+        }
+        if (_pointerAxisValue120Y != 0.0) {
+            deltaLines = static_cast<float>(-_pointerAxisValue120Y / 120.0);
+        }
 
         if (deltaX == 0.0f && deltaChars != 0.0f) {
             deltaX = deltaChars * kPixelsPerScroll;
@@ -1175,10 +1192,13 @@ void jwm::WindowManagerWayland::_flushPointerAxis() {
 
     _pointerAxisPending = false;
     _pointerAxisDiscretePending = false;
+    _pointerAxisValue120Pending = false;
     _pointerAxisX = 0.0;
     _pointerAxisY = 0.0;
     _pointerAxisDiscreteX = 0.0;
     _pointerAxisDiscreteY = 0.0;
+    _pointerAxisValue120X = 0.0;
+    _pointerAxisValue120Y = 0.0;
 }
 
 void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
@@ -1397,13 +1417,9 @@ void jwm::WindowManagerWayland::onPointerEnter(void* data, wl_pointer* pointer, 
         return;
     }
 
-    int previousX = manager->_pointerContentX;
-    int previousY = manager->_pointerContentY;
     window->toContentPixels(wl_fixed_to_double(sx), wl_fixed_to_double(sy), manager->_pointerContentX, manager->_pointerContentY);
 
-    int movementX = manager->_pointerContentX - previousX;
-    int movementY = manager->_pointerContentY - previousY;
-    manager->_dispatchMouseMove(window, movementX, movementY);
+    manager->_dispatchMouseMove(window, 0, 0);
     manager->_applyCursorForFocus();
 }
 
@@ -1413,6 +1429,9 @@ void jwm::WindowManagerWayland::onPointerLeave(void* data, wl_pointer* pointer, 
     manager->_pointerFocusWindow = nullptr;
     manager->_pointerEnterSerial = 0;
     manager->_pointerButtonMask = 0;
+    manager->_pointerAxisValue120Pending = false;
+    manager->_pointerAxisValue120X = 0.0;
+    manager->_pointerAxisValue120Y = 0.0;
 }
 
 void jwm::WindowManagerWayland::onPointerMotion(void* data, wl_pointer* pointer, uint32_t time, int32_t sx, int32_t sy) {
@@ -1507,6 +1526,33 @@ void jwm::WindowManagerWayland::onPointerAxisDiscrete(void* data, wl_pointer* po
     }
 }
 
+void jwm::WindowManagerWayland::onPointerAxisValue120(void* data, wl_pointer* pointer, uint32_t axis, int32_t value120) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_pointerFocusWindow == nullptr) {
+        return;
+    }
+
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        manager->_pointerAxisValue120X += static_cast<double>(value120);
+        manager->_pointerAxisValue120Pending = true;
+    } else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        manager->_pointerAxisValue120Y += static_cast<double>(value120);
+        manager->_pointerAxisValue120Pending = true;
+    }
+
+    uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(pointer));
+    if (version < WL_POINTER_FRAME_SINCE_VERSION) {
+        manager->_flushPointerAxis();
+    }
+}
+
+void jwm::WindowManagerWayland::onPointerAxisRelativeDirection(void* data, wl_pointer* pointer, uint32_t axis, uint32_t direction) {
+    (void) data;
+    (void) pointer;
+    (void) axis;
+    (void) direction;
+}
+
 void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboard, uint32_t format, int32_t fd, uint32_t size) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
 
@@ -1545,6 +1591,31 @@ void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboa
         JWM_LOG("Wayland: xkb_state_new failed");
         xkb_keymap_unref(keymap);
         return;
+    }
+
+    if (!manager->_pressedKeys.empty()) {
+        WindowWayland* focusedWindow = manager->_keyboardFocusWindow;
+        std::vector<std::pair<uint32_t, PressedKeyState>> pressedKeysSnapshot;
+        pressedKeysSnapshot.reserve(manager->_pressedKeys.size());
+        for (const auto& entry : manager->_pressedKeys) {
+            pressedKeysSnapshot.push_back(entry);
+        }
+
+        manager->_pressedKeys.clear();
+        manager->_cancelRepeat(std::numeric_limits<uint32_t>::max());
+        for (const auto& entry : pressedKeysSnapshot) {
+            const PressedKeyState& pressedKey = entry.second;
+            manager->_dispatchKey(
+                focusedWindow,
+                entry.first,
+                false,
+                pressedKey.key,
+                pressedKey.location,
+                pressedKey.extraModifiers,
+                false
+            );
+        }
+        KeyWayland::clearKeyStates();
     }
 
     if (manager->_xkbState != nullptr) {
