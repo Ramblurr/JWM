@@ -22,11 +22,14 @@ jobs:
     container: tonsky/jwm:latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash -c 'source /etc/profile && python3 script/build.py --only native'
+      - run: |
+          bash -c 'source /etc/profile && apt-get update -y && apt-get install -y libwayland-dev libwayland-bin wayland-protocols && python3 script/build.py --only native'
       - uses: actions/upload-artifact@v4
         with:
           name: native-linux
-          path: linux-x11/build/libjwm_x11_x64.so
+          path: |
+            linux-x11/build/libjwm_x11_x64.so
+            linux-wayland/build/libjwm_wayland_x64.so
 
   build_windows:
     runs-on: windows-latest
