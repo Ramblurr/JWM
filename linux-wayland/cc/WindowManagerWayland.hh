@@ -32,7 +32,10 @@ struct zwp_locked_pointer_v1;
 struct zwp_pointer_constraints_v1;
 struct zwp_relative_pointer_manager_v1;
 struct zwp_relative_pointer_v1;
+struct xdg_activation_v1;
+struct xdg_activation_token_v1;
 struct xdg_wm_base;
+struct zxdg_decoration_manager_v1;
 struct zxdg_output_manager_v1;
 struct zxdg_output_v1;
 struct xkb_context;
@@ -58,12 +61,15 @@ namespace jwm {
         wl_compositor* getCompositor() const;
         wl_shm* getShm() const;
         xdg_wm_base* getXdgWmBase() const;
+        zxdg_decoration_manager_v1* getDecorationManager() const;
         uint32_t getCompositorVersion() const;
         bool isReadyForWindows() const;
         void registerWindowSurface(wl_surface* surface, WindowWayland* window);
         void unregisterWindowSurface(wl_surface* surface);
         void requestCursorUpdate(WindowWayland* window);
         void requestPointerLock(WindowWayland* window, bool isLocked);
+        bool requestActivation(WindowWayland* window, wl_surface* surface);
+        bool isKeyboardFocusedWindow(const WindowWayland* window) const;
         bool tryGetScreenForOutput(wl_output* output, ScreenInfoWayland& screen) const;
         int getOutputScale(wl_output* output) const;
         bool hasOutput(wl_output* output) const;
@@ -102,6 +108,7 @@ namespace jwm {
         static void onKeyboardKey(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state);
         static void onKeyboardModifiers(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
         static void onKeyboardRepeatInfo(void* data, wl_keyboard* keyboard, int32_t rate, int32_t delay);
+        static void onActivationTokenDone(void* data, xdg_activation_token_v1* token, const char* tokenString);
 
         void _notifyLoop();
         void _drainNotifyPipe();
@@ -120,6 +127,9 @@ namespace jwm {
         bool _bindSeat(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindPointerConstraints(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindRelativePointerManager(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindDecorationManager(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindActivationManager(wl_registry* registry, uint32_t name, uint32_t version);
+        void _cancelActivationRequest();
         void _resetPointer();
         void _destroyRelativePointer();
         void _destroyLockedPointer();
@@ -157,6 +167,11 @@ namespace jwm {
         zwp_relative_pointer_manager_v1* _relativePointerManager = nullptr;
         zwp_relative_pointer_v1* _relativePointer = nullptr;
         zwp_locked_pointer_v1* _lockedPointer = nullptr;
+        zxdg_decoration_manager_v1* _decorationManager = nullptr;
+        xdg_activation_v1* _activationManager = nullptr;
+        xdg_activation_token_v1* _activationToken = nullptr;
+        wl_surface* _activationSurface = nullptr;
+        WindowWayland* _activationWindow = nullptr;
         uint32_t _compositorName = std::numeric_limits<uint32_t>::max();
         uint32_t _compositorVersion = 0;
         uint32_t _shmName = std::numeric_limits<uint32_t>::max();
@@ -165,6 +180,8 @@ namespace jwm {
         uint32_t _seatVersion = 0;
         uint32_t _pointerConstraintsName = std::numeric_limits<uint32_t>::max();
         uint32_t _relativePointerManagerName = std::numeric_limits<uint32_t>::max();
+        uint32_t _decorationManagerName = std::numeric_limits<uint32_t>::max();
+        uint32_t _activationManagerName = std::numeric_limits<uint32_t>::max();
         zxdg_output_manager_v1* _xdgOutputManager = nullptr;
         uint32_t _xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
         bool _runLoop = false;
@@ -180,6 +197,7 @@ namespace jwm {
         std::map<WindowWayland*, bool> _pointerLockRequests;
         WindowWayland* _pointerFocusWindow = nullptr;
         WindowWayland* _keyboardFocusWindow = nullptr;
+        uint32_t _lastInputSerial = 0;
         WindowWayland* _pointerLockWindow = nullptr;
         bool _isPointerLockActive = false;
         uint32_t _pointerEnterSerial = 0;

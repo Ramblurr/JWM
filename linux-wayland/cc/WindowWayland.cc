@@ -17,6 +17,7 @@
 #include "WindowWayland.hh"
 #include "impl/JNILocal.hh"
 #include "impl/Library.hh"
+#include "xdg-decoration-unstable-v1-client-protocol.hh"
 #include "xdg-shell-client-protocol.hh"
 
 namespace jwm {
@@ -42,6 +43,10 @@ namespace jwm {
         xdg_toplevel_listener kXdgToplevelListener {
             &WindowWayland::onXdgToplevelConfigure,
             &WindowWayland::onXdgToplevelClose
+        };
+
+        zxdg_toplevel_decoration_v1_listener kXdgDecorationListener {
+            &WindowWayland::onXdgDecorationConfigure
         };
 
         wl_callback_listener kFrameCallbackListener {
@@ -145,6 +150,8 @@ void jwm::WindowWayland::setVisible(bool visible) {
     _waitForShowHideSyncIfNeeded();
     _isConfigured = false;
     _isFrameRequested = false;
+    _isActivated = false;
+    _pendingMinimizeRequest = false;
     _destroyFrameCallback();
     _destroyRoleObjects();
     if (_wlSurface != nullptr) {
@@ -159,8 +166,46 @@ bool jwm::WindowWayland::isVisible() const {
     return _isVisible;
 }
 
+void jwm::WindowWayland::maximize() {
+    _requestedMaximized = true;
+    _pendingMinimizeRequest = false;
+    if (_xdgToplevel == nullptr) {
+        return;
+    }
+    xdg_toplevel_set_maximized(_xdgToplevel);
+    if (_wlSurface != nullptr) {
+        wl_surface_commit(_wlSurface);
+    }
+}
+
+void jwm::WindowWayland::minimize() {
+    _pendingMinimizeRequest = true;
+    if (_xdgToplevel == nullptr) {
+        return;
+    }
+    xdg_toplevel_set_minimized(_xdgToplevel);
+    if (_wlSurface != nullptr) {
+        wl_surface_commit(_wlSurface);
+    }
+}
+
+void jwm::WindowWayland::restore() {
+    _requestedMaximized = false;
+    _requestedFullScreen = false;
+    _pendingMinimizeRequest = false;
+    if (_xdgToplevel == nullptr) {
+        return;
+    }
+    xdg_toplevel_unset_maximized(_xdgToplevel);
+    xdg_toplevel_unset_fullscreen(_xdgToplevel);
+    if (_wlSurface != nullptr) {
+        wl_surface_commit(_wlSurface);
+    }
+}
+
 void jwm::WindowWayland::setFullScreen(bool value) {
-    _isFullScreen = value;
+    _requestedFullScreen = value;
+    _pendingMinimizeRequest = false;
     if (_xdgToplevel == nullptr) {
         return;
     }
@@ -178,6 +223,14 @@ void jwm::WindowWayland::setFullScreen(bool value) {
 
 bool jwm::WindowWayland::isFullScreen() const {
     return _isFullScreen;
+}
+
+void jwm::WindowWayland::setTitlebarVisible(bool isVisible) {
+    _titlebarVisible = isVisible;
+    _applyDecorationMode();
+    if (_wlSurface != nullptr) {
+        wl_surface_commit(_wlSurface);
+    }
 }
 
 void jwm::WindowWayland::setTitle(const std::string& title) {
@@ -198,6 +251,17 @@ void jwm::WindowWayland::setAppId(const std::string& appId) {
             wl_surface_commit(_wlSurface);
         }
     }
+}
+
+void jwm::WindowWayland::requestActivation() {
+    if (_isClosed || _wlSurface == nullptr) {
+        return;
+    }
+    _windowManager.requestActivation(this, _wlSurface);
+}
+
+bool jwm::WindowWayland::isFront() const {
+    return _windowManager.isKeyboardFocusedWindow(this);
 }
 
 void jwm::WindowWayland::close() {
@@ -337,12 +401,9 @@ bool jwm::WindowWayland::hasEnteredOutput(wl_output* output) const {
 }
 
 void jwm::WindowWayland::handleOutputMetricsChanged(wl_output* output) {
-    if (output != nullptr) {
+    if (output != nullptr && !_enteredOutputs.empty()) {
         auto it = std::find(_enteredOutputs.begin(), _enteredOutputs.end(), output);
-        if (it == _enteredOutputs.end()) {
-            return;
-        }
-        if (!_windowManager.hasOutput(output)) {
+        if (it != _enteredOutputs.end() && !_windowManager.hasOutput(output)) {
             _enteredOutputs.erase(it);
         }
     }
@@ -361,12 +422,18 @@ void jwm::WindowWayland::onXdgSurfaceConfigure(void* data, xdg_surface* xdgSurfa
 
 void jwm::WindowWayland::onXdgToplevelConfigure(void* data, xdg_toplevel* xdgToplevel, int32_t width, int32_t height, wl_array* states) {
     WindowWayland* instance = static_cast<WindowWayland*>(data);
-    instance->_handleXdgToplevelConfigure(width, height);
+    instance->_handleXdgToplevelConfigure(width, height, states);
 }
 
 void jwm::WindowWayland::onXdgToplevelClose(void* data, xdg_toplevel* xdgToplevel) {
     WindowWayland* instance = static_cast<WindowWayland*>(data);
     instance->dispatch(classes::EventWindowCloseRequest::kInstance);
+}
+
+void jwm::WindowWayland::onXdgDecorationConfigure(void* data, zxdg_toplevel_decoration_v1* decoration, uint32_t mode) {
+    (void) data;
+    (void) decoration;
+    (void) mode;
 }
 
 void jwm::WindowWayland::onFrameDone(void* data, wl_callback* callback, uint32_t callbackData) {
@@ -401,9 +468,16 @@ void jwm::WindowWayland::onSurfaceLeave(void* data, wl_surface* surface, wl_outp
 
 #if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
 void jwm::WindowWayland::onSurfacePreferredBufferScale(void* data, wl_surface* surface, int32_t factor) {
-    (void) data;
     (void) surface;
-    (void) factor;
+    WindowWayland* instance = static_cast<WindowWayland*>(data);
+    if (factor <= 0) {
+        return;
+    }
+    instance->_preferredBufferScale = std::max(1, factor);
+    instance->_updateBufferScaleFromOutputs();
+    if (instance->_isVisible && instance->_wlSurface != nullptr) {
+        wl_surface_commit(instance->_wlSurface);
+    }
 }
 
 void jwm::WindowWayland::onSurfacePreferredBufferTransform(void* data, wl_surface* surface, uint32_t transform) {
@@ -450,7 +524,20 @@ bool jwm::WindowWayland::_refreshScreenAssociation() {
 
     if (!hasScreen) {
         auto screens = _windowManager.getScreens();
-        if (!screens.empty()) {
+        int logicalX = _logicalContentRect.fLeft;
+        int logicalY = _logicalContentRect.fTop;
+        int logicalWidth = std::max(_logicalContentRect.getWidth(), 1);
+        int logicalHeight = std::max(_logicalContentRect.getHeight(), 1);
+        int centerX = logicalX + logicalWidth / 2;
+        int centerY = logicalY + logicalHeight / 2;
+        for (const auto& candidate : screens) {
+            if (candidate.bounds.isPointInside(centerX, centerY)) {
+                nextScreenId = candidate.id;
+                hasScreen = true;
+                break;
+            }
+        }
+        if (!hasScreen && !screens.empty()) {
             nextScreenId = screens.front().id;
         }
     }
@@ -500,6 +587,10 @@ bool jwm::WindowWayland::_updateBufferScaleFromOutputs() {
 }
 
 int jwm::WindowWayland::_resolveEnteredOutputScale() const {
+    if (_preferredBufferScale > 0) {
+        return std::max(1, _preferredBufferScale);
+    }
+
     if (_enteredOutputs.empty()) {
         return _resolveBufferScale();
     }
@@ -586,12 +677,74 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
     }
 }
 
-void jwm::WindowWayland::_handleXdgToplevelConfigure(int32_t width, int32_t height) {
+void jwm::WindowWayland::_handleXdgToplevelConfigure(int32_t width, int32_t height, wl_array* states) {
     if (width > 0) {
         _pendingWidth = width;
     }
     if (height > 0) {
         _pendingHeight = height;
+    }
+
+    bool nextMaximized = false;
+    bool nextFullScreen = false;
+    bool nextActivated = false;
+
+    if (states != nullptr && states->data != nullptr) {
+        uint32_t* stateData = static_cast<uint32_t*>(states->data);
+        size_t stateCount = states->size / sizeof(uint32_t);
+        for (size_t i = 0; i < stateCount; ++i) {
+            switch (stateData[i]) {
+                case XDG_TOPLEVEL_STATE_MAXIMIZED:
+                    nextMaximized = true;
+                    break;
+                case XDG_TOPLEVEL_STATE_FULLSCREEN:
+                    nextFullScreen = true;
+                    break;
+                case XDG_TOPLEVEL_STATE_ACTIVATED:
+                    nextActivated = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    bool nextMinimized = _isMinimized;
+    if (_pendingMinimizeRequest && !nextActivated && !nextMaximized && !nextFullScreen) {
+        nextMinimized = true;
+    }
+    if (nextActivated || nextMaximized || nextFullScreen) {
+        nextMinimized = false;
+    }
+
+    if (!_isFullScreen && nextFullScreen) {
+        dispatch(classes::EventWindowFullScreenEnter::kInstance);
+    } else if (_isFullScreen && !nextFullScreen) {
+        dispatch(classes::EventWindowFullScreenExit::kInstance);
+    }
+
+    if (!_isMaximized && nextMaximized) {
+        dispatch(classes::EventWindowMaximize::kInstance);
+    }
+
+    if (!_isMinimized && nextMinimized) {
+        dispatch(classes::EventWindowMinimize::kInstance);
+    }
+
+    bool wasRestorable = _isMaximized || _isMinimized;
+    bool isNowNormal = !nextMaximized && !nextMinimized && !nextFullScreen;
+    if (wasRestorable && isNowNormal) {
+        dispatch(classes::EventWindowRestore::kInstance);
+    }
+
+    _isMaximized = nextMaximized;
+    _isFullScreen = nextFullScreen;
+    _isActivated = nextActivated;
+    _isMinimized = nextMinimized;
+    _requestedMaximized = nextMaximized;
+    _requestedFullScreen = nextFullScreen;
+    if (_isActivated || _isMinimized) {
+        _pendingMinimizeRequest = false;
     }
 }
 
@@ -694,8 +847,27 @@ bool jwm::WindowWayland::_ensureSurface() {
     if (!_appId.empty()) {
         xdg_toplevel_set_app_id(_xdgToplevel, _appId.c_str());
     }
-    if (_isFullScreen) {
+    if (_requestedFullScreen) {
         xdg_toplevel_set_fullscreen(_xdgToplevel, nullptr);
+    }
+    if (_requestedMaximized) {
+        xdg_toplevel_set_maximized(_xdgToplevel);
+    }
+
+    zxdg_decoration_manager_v1* decorationManager = _windowManager.getDecorationManager();
+    if (decorationManager != nullptr) {
+        _xdgDecoration = zxdg_decoration_manager_v1_get_toplevel_decoration(decorationManager, _xdgToplevel);
+        if (_xdgDecoration == nullptr) {
+            JWM_LOG("Wayland: zxdg_decoration_manager_v1_get_toplevel_decoration failed");
+            _destroyRoleObjects();
+            return false;
+        }
+        if (zxdg_toplevel_decoration_v1_add_listener(_xdgDecoration, &kXdgDecorationListener, this) != 0) {
+            JWM_LOG("Wayland: zxdg_toplevel_decoration_v1_add_listener failed");
+            _destroyRoleObjects();
+            return false;
+        }
+        _applyDecorationMode();
     }
 
     _isConfigured = false;
@@ -737,6 +909,27 @@ int jwm::WindowWayland::_resolveBufferScale() const {
         return 1;
     }
     float scale = screens.front().scale;
+    if (_screenId != std::numeric_limits<long>::min()) {
+        for (const auto& candidate : screens) {
+            if (candidate.id == _screenId) {
+                scale = candidate.scale;
+                break;
+            }
+        }
+    } else {
+        int logicalX = _logicalContentRect.fLeft;
+        int logicalY = _logicalContentRect.fTop;
+        int logicalWidth = std::max(_logicalContentRect.getWidth(), 1);
+        int logicalHeight = std::max(_logicalContentRect.getHeight(), 1);
+        int centerX = logicalX + logicalWidth / 2;
+        int centerY = logicalY + logicalHeight / 2;
+        for (const auto& candidate : screens) {
+            if (candidate.bounds.isPointInside(centerX, centerY)) {
+                scale = candidate.scale;
+                break;
+            }
+        }
+    }
     if (scale < 1.f) {
         scale = 1.f;
     }
@@ -808,6 +1001,23 @@ bool jwm::WindowWayland::_ensureShmBuffer(int width, int height) {
     return true;
 }
 
+void jwm::WindowWayland::_applyDecorationMode() {
+    if (_xdgDecoration == nullptr) {
+        return;
+    }
+    uint32_t mode = _titlebarVisible
+        ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+        : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+    zxdg_toplevel_decoration_v1_set_mode(_xdgDecoration, mode);
+}
+
+void jwm::WindowWayland::_destroyDecoration() {
+    if (_xdgDecoration != nullptr) {
+        zxdg_toplevel_decoration_v1_destroy(_xdgDecoration);
+        _xdgDecoration = nullptr;
+    }
+}
+
 void jwm::WindowWayland::_destroyFrameCallback() {
     if (_wlFrameCallback != nullptr) {
         wl_callback_destroy(_wlFrameCallback);
@@ -855,6 +1065,12 @@ void jwm::WindowWayland::_destroySurface() {
     _isConfigured = false;
     _isFrameRequested = false;
     _bufferScale = 1;
+    _preferredBufferScale = 0;
+    _isActivated = false;
+    _isMinimized = false;
+    _isMaximized = false;
+    _isFullScreen = false;
+    _pendingMinimizeRequest = false;
     _screenId = std::numeric_limits<long>::min();
     _enteredOutputs.clear();
     _windowManager.requestPointerLock(this, false);
@@ -873,6 +1089,7 @@ void jwm::WindowWayland::_destroySurface() {
 
 void jwm::WindowWayland::_destroyRoleObjects() {
     _lastConfigureSerial = 0;
+    _destroyDecoration();
     if (_xdgToplevel != nullptr) {
         xdg_toplevel_destroy(_xdgToplevel);
         _xdgToplevel = nullptr;
@@ -973,14 +1190,26 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nL
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nMaximize
         (JNIEnv* env, jobject obj) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->maximize();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nMinimize
         (JNIEnv* env, jobject obj) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->minimize();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nRestore
         (JNIEnv* env, jobject obj) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->restore();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nSetTitlebarVisible
+        (JNIEnv* env, jobject obj, jboolean isVisible) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->setTitlebarVisible(isVisible == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nSetFullScreen
@@ -993,4 +1222,16 @@ extern "C" JNIEXPORT jboolean JNICALL Java_io_github_humbleui_jwm_WindowWayland_
         (JNIEnv* env, jobject obj) {
     jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
     return instance->isFullScreen();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nRequestActivation
+        (JNIEnv* env, jobject obj) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->requestActivation();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nIsFront
+        (JNIEnv* env, jobject obj) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    return instance->isFront();
 }

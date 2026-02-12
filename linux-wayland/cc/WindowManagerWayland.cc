@@ -25,6 +25,8 @@
 #include "WindowWayland.hh"
 #include "impl/JNILocal.hh"
 #include "impl/Library.hh"
+#include "xdg-activation-v1-client-protocol.hh"
+#include "xdg-decoration-unstable-v1-client-protocol.hh"
 #include "pointer-constraints-unstable-v1-client-protocol.hh"
 #include "relative-pointer-unstable-v1-client-protocol.hh"
 #include "xdg-output-unstable-v1-client-protocol.hh"
@@ -92,6 +94,10 @@ namespace {
     zwp_locked_pointer_v1_listener kLockedPointerListener {
         &jwm::WindowManagerWayland::onLockedPointerLocked,
         &jwm::WindowManagerWayland::onLockedPointerUnlocked
+    };
+
+    xdg_activation_token_v1_listener kActivationTokenListener {
+        &jwm::WindowManagerWayland::onActivationTokenDone
     };
 
     constexpr xkb_keycode_t kXkbKeycodeOffset = 8;
@@ -381,6 +387,7 @@ void jwm::WindowManagerWayland::_resetSeat() {
     }
     _seatName = std::numeric_limits<uint32_t>::max();
     _seatVersion = 0;
+    _lastInputSerial = 0;
 }
 
 void jwm::WindowManagerWayland::_cleanup() {
@@ -389,6 +396,7 @@ void jwm::WindowManagerWayland::_cleanup() {
     _resetSeat();
     _destroyCursorResources();
     _pointerLockRequests.clear();
+    _cancelActivationRequest();
 
     if (_relativePointerManager != nullptr) {
         zwp_relative_pointer_manager_v1_destroy(_relativePointerManager);
@@ -400,6 +408,18 @@ void jwm::WindowManagerWayland::_cleanup() {
         _pointerConstraints = nullptr;
     }
     _pointerConstraintsName = std::numeric_limits<uint32_t>::max();
+
+    if (_activationManager != nullptr) {
+        xdg_activation_v1_destroy(_activationManager);
+        _activationManager = nullptr;
+    }
+    _activationManagerName = std::numeric_limits<uint32_t>::max();
+
+    if (_decorationManager != nullptr) {
+        zxdg_decoration_manager_v1_destroy(_decorationManager);
+        _decorationManager = nullptr;
+    }
+    _decorationManagerName = std::numeric_limits<uint32_t>::max();
 
     _clearXdgOutputBindings();
 
@@ -452,6 +472,7 @@ void jwm::WindowManagerWayland::_cleanup() {
     }
 
     _pendingCursorWindow = nullptr;
+    _lastInputSerial = 0;
 
     if (_notifyReadFd >= 0) {
         close(_notifyReadFd);
@@ -678,6 +699,47 @@ bool jwm::WindowManagerWayland::_bindRelativePointerManager(wl_registry* registr
     return true;
 }
 
+bool jwm::WindowManagerWayland::_bindDecorationManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_decorationManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _decorationManager = static_cast<zxdg_decoration_manager_v1*>(
+        wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, bindVersion));
+    if (_decorationManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(zxdg_decoration_manager_v1) failed");
+        return false;
+    }
+    _decorationManagerName = name;
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindActivationManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_activationManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _activationManager = static_cast<xdg_activation_v1*>(
+        wl_registry_bind(registry, name, &xdg_activation_v1_interface, bindVersion));
+    if (_activationManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(xdg_activation_v1) failed");
+        return false;
+    }
+    _activationManagerName = name;
+    return true;
+}
+
+void jwm::WindowManagerWayland::_cancelActivationRequest() {
+    if (_activationToken != nullptr) {
+        xdg_activation_token_v1_destroy(_activationToken);
+        _activationToken = nullptr;
+    }
+    _activationSurface = nullptr;
+    _activationWindow = nullptr;
+}
+
 wl_display* jwm::WindowManagerWayland::getDisplay() const {
     return _display;
 }
@@ -692,6 +754,10 @@ wl_shm* jwm::WindowManagerWayland::getShm() const {
 
 xdg_wm_base* jwm::WindowManagerWayland::getXdgWmBase() const {
     return _xdgWmBase;
+}
+
+zxdg_decoration_manager_v1* jwm::WindowManagerWayland::getDecorationManager() const {
+    return _decorationManager;
 }
 
 uint32_t jwm::WindowManagerWayland::getCompositorVersion() const {
@@ -726,6 +792,9 @@ void jwm::WindowManagerWayland::unregisterWindowSurface(wl_surface* surface) {
     WindowWayland* window = it->second;
     _surfaceToWindow.erase(it);
     _pointerLockRequests.erase(window);
+    if (_activationWindow == window || _activationSurface == surface) {
+        _cancelActivationRequest();
+    }
 
     if (_pointerFocusWindow == window) {
         _pointerFocusWindow = nullptr;
@@ -768,6 +837,42 @@ void jwm::WindowManagerWayland::requestPointerLock(WindowWayland* window, bool i
     }
 
     _updatePointerLock();
+}
+
+bool jwm::WindowManagerWayland::requestActivation(WindowWayland* window, wl_surface* surface) {
+    if (_activationManager == nullptr || window == nullptr || surface == nullptr) {
+        return false;
+    }
+    if (_windowBySurface(surface) != window) {
+        return false;
+    }
+
+    _cancelActivationRequest();
+
+    _activationToken = xdg_activation_v1_get_activation_token(_activationManager);
+    if (_activationToken == nullptr) {
+        JWM_LOG("Wayland: xdg_activation_v1_get_activation_token failed");
+        return false;
+    }
+
+    _activationSurface = surface;
+    _activationWindow = window;
+    if (xdg_activation_token_v1_add_listener(_activationToken, &kActivationTokenListener, this) != 0) {
+        JWM_LOG("Wayland: xdg_activation_token_v1_add_listener failed");
+        _cancelActivationRequest();
+        return false;
+    }
+
+    xdg_activation_token_v1_set_surface(_activationToken, surface);
+    if (_seat != nullptr && _lastInputSerial != 0) {
+        xdg_activation_token_v1_set_serial(_activationToken, _lastInputSerial, _seat);
+    }
+    xdg_activation_token_v1_commit(_activationToken);
+    return true;
+}
+
+bool jwm::WindowManagerWayland::isKeyboardFocusedWindow(const WindowWayland* window) const {
+    return window != nullptr && _keyboardFocusWindow == window;
 }
 
 bool jwm::WindowManagerWayland::tryGetScreenForOutput(wl_output* output, ScreenInfoWayland& screen) const {
@@ -1429,6 +1534,30 @@ void jwm::WindowManagerWayland::_flushPointerAxis() {
     _pointerAxisValue120Y = 0.0;
 }
 
+void jwm::WindowManagerWayland::onActivationTokenDone(void* data, xdg_activation_token_v1* token, const char* tokenString) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (manager->_activationToken != token) {
+        if (token != nullptr) {
+            xdg_activation_token_v1_destroy(token);
+        }
+        return;
+    }
+
+    bool canActivate =
+        manager->_activationManager != nullptr &&
+        manager->_activationSurface != nullptr &&
+        manager->_activationWindow != nullptr &&
+        tokenString != nullptr &&
+        tokenString[0] != '\0' &&
+        manager->_windowBySurface(manager->_activationSurface) == manager->_activationWindow;
+
+    if (canActivate) {
+        xdg_activation_v1_activate(manager->_activationManager, tokenString, manager->_activationSurface);
+    }
+
+    manager->_cancelActivationRequest();
+}
+
 void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
@@ -1457,6 +1586,14 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
     }
     if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
         manager->_bindRelativePointerManager(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
+        manager->_bindDecorationManager(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, xdg_activation_v1_interface.name) == 0) {
+        manager->_bindActivationManager(registry, name, version);
         return;
     }
     if (strcmp(interface, wl_output_interface.name) != 0) {
@@ -1541,6 +1678,23 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         }
         manager->_relativePointerManagerName = std::numeric_limits<uint32_t>::max();
         manager->_applyCursorForFocus();
+        return;
+    }
+    if (name == manager->_decorationManagerName) {
+        if (manager->_decorationManager != nullptr) {
+            zxdg_decoration_manager_v1_destroy(manager->_decorationManager);
+            manager->_decorationManager = nullptr;
+        }
+        manager->_decorationManagerName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
+    if (name == manager->_activationManagerName) {
+        manager->_cancelActivationRequest();
+        if (manager->_activationManager != nullptr) {
+            xdg_activation_v1_destroy(manager->_activationManager);
+            manager->_activationManager = nullptr;
+        }
+        manager->_activationManagerName = std::numeric_limits<uint32_t>::max();
         return;
     }
     if (name == manager->_xdgOutputManagerName) {
@@ -1697,6 +1851,7 @@ void jwm::WindowManagerWayland::onPointerEnter(void* data, wl_pointer* pointer, 
     WindowWayland* window = manager->_windowBySurface(surface);
     manager->_pointerFocusWindow = window;
     manager->_pointerEnterSerial = serial;
+    manager->_lastInputSerial = serial;
 
     if (window == nullptr) {
         return;
@@ -1745,6 +1900,7 @@ void jwm::WindowManagerWayland::onPointerMotion(void* data, wl_pointer* pointer,
 
 void jwm::WindowManagerWayland::onPointerButton(void* data, wl_pointer* pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_lastInputSerial = serial;
     if (manager->_pointerFocusWindow == nullptr || !MouseButtonWayland::isButton(button)) {
         return;
     }
@@ -1970,6 +2126,7 @@ void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboa
 
 void jwm::WindowManagerWayland::onKeyboardEnter(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface, wl_array* keys) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_lastInputSerial = serial;
     WindowWayland* window = manager->_windowBySurface(surface);
     manager->_handleKeyboardFocusEnter(window, keys);
 }
@@ -1981,6 +2138,7 @@ void jwm::WindowManagerWayland::onKeyboardLeave(void* data, wl_keyboard* keyboar
 
 void jwm::WindowManagerWayland::onKeyboardKey(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t time, uint32_t keycode, uint32_t state) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_lastInputSerial = serial;
     WindowWayland* window = manager->_keyboardFocusWindow;
     if (window == nullptr) {
         return;
@@ -2024,6 +2182,7 @@ void jwm::WindowManagerWayland::onKeyboardKey(void* data, wl_keyboard* keyboard,
 
 void jwm::WindowManagerWayland::onKeyboardModifiers(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_lastInputSerial = serial;
     if (manager->_xkbState == nullptr) {
         return;
     }

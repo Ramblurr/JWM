@@ -75,6 +75,8 @@ public class WindowWayland extends Window {
 
     @Override
     public Window setTitlebarVisible(boolean value) {
+        assert _onUIThread() : "Should be run on UI thread";
+        _nSetTitlebarVisible(value);
         return this;
     }
 
@@ -146,19 +148,21 @@ public class WindowWayland extends Window {
     @Override
     public Window focus() {
         assert _onUIThread() : "Should be run on UI thread";
+        _nRequestActivation();
         return this;
     }
 
     @Override
     public Window bringToFront() {
         assert _onUIThread() : "Should be run on UI thread";
+        _nRequestActivation();
         return this;
     }
 
     @Override
     public boolean isFront() {
         assert _onUIThread() : "Should be run on UI thread";
-        return false;
+        return _nIsFront();
     }
 
     @Override
@@ -218,7 +222,10 @@ public class WindowWayland extends Window {
     @ApiStatus.Internal public native void _nRestore();
     @ApiStatus.Internal public native void _nSetTitle(String title);
     @ApiStatus.Internal public native void _nSetAppId(String appId);
+    @ApiStatus.Internal public native void _nSetTitlebarVisible(boolean isVisible);
     @ApiStatus.Internal public native void _nLockMouseCursor(boolean value);
     @ApiStatus.Internal public native void _nSetFullScreen(boolean isFullScreen);
     @ApiStatus.Internal public native boolean _nIsFullScreen();
+    @ApiStatus.Internal public native void _nRequestActivation();
+    @ApiStatus.Internal public native boolean _nIsFront();
 }

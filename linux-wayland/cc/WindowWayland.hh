@@ -21,6 +21,7 @@ struct wl_output;
 struct wl_array;
 struct xdg_surface;
 struct xdg_toplevel;
+struct zxdg_toplevel_decoration_v1;
 
 namespace jwm {
     class WindowWayland: public Window {
@@ -35,10 +36,16 @@ namespace jwm {
         void setContentSize(int width, int height);
         void setVisible(bool visible);
         bool isVisible() const;
+        void maximize();
+        void minimize();
+        void restore();
         void setFullScreen(bool value);
         bool isFullScreen() const;
+        void setTitlebarVisible(bool isVisible);
         void setTitle(const std::string& title);
         void setAppId(const std::string& appId);
+        void requestActivation();
+        bool isFront() const;
         void close();
         jobject getScreen(JNIEnv* env);
 
@@ -62,6 +69,7 @@ namespace jwm {
         static void onXdgSurfaceConfigure(void* data, xdg_surface* xdgSurface, uint32_t serial);
         static void onXdgToplevelConfigure(void* data, xdg_toplevel* xdgToplevel, int32_t width, int32_t height, wl_array* states);
         static void onXdgToplevelClose(void* data, xdg_toplevel* xdgToplevel);
+        static void onXdgDecorationConfigure(void* data, zxdg_toplevel_decoration_v1* decoration, uint32_t mode);
         static void onFrameDone(void* data, wl_callback* callback, uint32_t callbackData);
         static void onShowHideSyncDone(void* data, wl_callback* callback, uint32_t callbackData);
         static void onSurfaceEnter(void* data, wl_surface* surface, wl_output* output);
@@ -72,7 +80,7 @@ namespace jwm {
 #endif
 
         void _handleXdgSurfaceConfigure(uint32_t serial);
-        void _handleXdgToplevelConfigure(int32_t width, int32_t height);
+        void _handleXdgToplevelConfigure(int32_t width, int32_t height, wl_array* states);
         void _handleFrameDone(wl_callback* callback);
         void _handleSurfaceEnter(wl_output* output);
         void _handleSurfaceLeave(wl_output* output);
@@ -86,6 +94,8 @@ namespace jwm {
         int _resolveBufferScale() const;
         int _toBufferPixels(int logicalValue) const;
         bool _ensureShmBuffer(int width, int height);
+        void _applyDecorationMode();
+        void _destroyDecoration();
         void _destroyShowHideSyncCallback();
         void _destroyEglWindow();
         void _destroyFrameCallback();
@@ -101,6 +111,7 @@ namespace jwm {
         wl_callback* _showHideSyncCallback = nullptr;
         xdg_surface* _xdgSurface = nullptr;
         xdg_toplevel* _xdgToplevel = nullptr;
+        zxdg_toplevel_decoration_v1* _xdgDecoration = nullptr;
 
         int _bufferFd = -1;
         void* _bufferData = nullptr;
@@ -117,11 +128,19 @@ namespace jwm {
         int32_t _pendingWidth = 800;
         int32_t _pendingHeight = 600;
         int _bufferScale = 1;
+        int _preferredBufferScale = 0;
         uint32_t _lastConfigureSerial = 0;
 
         bool _isVisible = false;
         bool _isConfigured = false;
+        bool _isMaximized = false;
+        bool _isMinimized = false;
         bool _isFullScreen = false;
+        bool _isActivated = false;
+        bool _titlebarVisible = true;
+        bool _requestedMaximized = false;
+        bool _requestedFullScreen = false;
+        bool _pendingMinimizeRequest = false;
         bool _isClosed = false;
         bool _isFrameRequested = false;
         bool _showHideSyncRequired = false;
