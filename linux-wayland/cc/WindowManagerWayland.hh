@@ -38,6 +38,8 @@ struct xdg_wm_base;
 struct zxdg_decoration_manager_v1;
 struct zxdg_output_manager_v1;
 struct zxdg_output_v1;
+struct wp_fractional_scale_manager_v1;
+struct wp_viewporter;
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
@@ -62,6 +64,8 @@ namespace jwm {
         wl_shm* getShm() const;
         xdg_wm_base* getXdgWmBase() const;
         zxdg_decoration_manager_v1* getDecorationManager() const;
+        wp_viewporter* getViewporter() const;
+        wp_fractional_scale_manager_v1* getFractionalScaleManager() const;
         uint32_t getCompositorVersion() const;
         bool isReadyForWindows() const;
         void registerWindowSurface(wl_surface* surface, WindowWayland* window);
@@ -129,6 +133,10 @@ namespace jwm {
         bool _bindRelativePointerManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindDecorationManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindActivationManager(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindViewporter(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindFractionalScaleManager(wl_registry* registry, uint32_t name, uint32_t version);
+        void _notifyWindowsOutputMetricsChanged(wl_output* output);
+        void _notifyWindowsScaleCapabilityChanged();
         void _cancelActivationRequest();
         void _resetPointer();
         void _destroyRelativePointer();
@@ -172,6 +180,8 @@ namespace jwm {
         xdg_activation_token_v1* _activationToken = nullptr;
         wl_surface* _activationSurface = nullptr;
         WindowWayland* _activationWindow = nullptr;
+        wp_viewporter* _viewporter = nullptr;
+        wp_fractional_scale_manager_v1* _fractionalScaleManager = nullptr;
         uint32_t _compositorName = std::numeric_limits<uint32_t>::max();
         uint32_t _compositorVersion = 0;
         uint32_t _shmName = std::numeric_limits<uint32_t>::max();
@@ -182,6 +192,8 @@ namespace jwm {
         uint32_t _relativePointerManagerName = std::numeric_limits<uint32_t>::max();
         uint32_t _decorationManagerName = std::numeric_limits<uint32_t>::max();
         uint32_t _activationManagerName = std::numeric_limits<uint32_t>::max();
+        uint32_t _viewporterName = std::numeric_limits<uint32_t>::max();
+        uint32_t _fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
         zxdg_output_manager_v1* _xdgOutputManager = nullptr;
         uint32_t _xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
         bool _runLoop = false;

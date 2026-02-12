@@ -19,6 +19,8 @@ struct wl_egl_window;
 struct wl_surface;
 struct wl_output;
 struct wl_array;
+struct wp_fractional_scale_v1;
+struct wp_viewport;
 struct xdg_surface;
 struct xdg_toplevel;
 struct zxdg_toplevel_decoration_v1;
@@ -63,6 +65,7 @@ namespace jwm {
         int toContentPixels(double logicalValue) const;
         bool hasEnteredOutput(wl_output* output) const;
         void handleOutputMetricsChanged(wl_output* output);
+        void handleScaleProtocolGlobalsChanged();
 
         WindowManagerWayland& getWindowManager();
 
@@ -78,6 +81,7 @@ namespace jwm {
         static void onSurfacePreferredBufferScale(void* data, wl_surface* surface, int32_t factor);
         static void onSurfacePreferredBufferTransform(void* data, wl_surface* surface, uint32_t transform);
 #endif
+        static void onFractionalScalePreferredScale(void* data, wp_fractional_scale_v1* fractionalScale, uint32_t scale);
 
         void _handleXdgSurfaceConfigure(uint32_t serial);
         void _handleXdgToplevelConfigure(int32_t width, int32_t height, wl_array* states);
@@ -87,11 +91,15 @@ namespace jwm {
         bool _refreshScreenAssociation();
         bool _updateBufferScaleFromOutputs();
         int _resolveEnteredOutputScale() const;
+        uint32_t _resolveScaleNumerator() const;
+        uint32_t _effectiveScaleNumerator() const;
+        bool _isFractionalScalingEnabled() const;
+        bool _syncScaleProtocolObjects();
+        void _destroyScaleProtocolObjects();
         bool _armFrameCallbackIfNeeded();
         bool _ensureSurface();
         void _waitForShowHideSyncIfNeeded();
         void _queueShowHideSync();
-        int _resolveBufferScale() const;
         int _toBufferPixels(int logicalValue) const;
         bool _ensureShmBuffer(int width, int height);
         void _applyDecorationMode();
@@ -109,6 +117,8 @@ namespace jwm {
         wl_buffer* _wlBuffer = nullptr;
         wl_callback* _wlFrameCallback = nullptr;
         wl_callback* _showHideSyncCallback = nullptr;
+        wp_viewport* _wpViewport = nullptr;
+        wp_fractional_scale_v1* _wpFractionalScale = nullptr;
         xdg_surface* _xdgSurface = nullptr;
         xdg_toplevel* _xdgToplevel = nullptr;
         zxdg_toplevel_decoration_v1* _xdgDecoration = nullptr;
@@ -129,6 +139,8 @@ namespace jwm {
         int32_t _pendingHeight = 600;
         int _bufferScale = 1;
         int _preferredBufferScale = 0;
+        uint32_t _preferredFractionalScaleNumerator = 0;
+        uint32_t _scaleNumerator = 120;
         uint32_t _lastConfigureSerial = 0;
 
         bool _isVisible = false;

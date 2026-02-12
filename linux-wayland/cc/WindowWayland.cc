@@ -17,6 +17,8 @@
 #include "WindowWayland.hh"
 #include "impl/JNILocal.hh"
 #include "impl/Library.hh"
+#include "fractional-scale-v1-client-protocol.hh"
+#include "viewporter-client-protocol.hh"
 #include "xdg-decoration-unstable-v1-client-protocol.hh"
 #include "xdg-shell-client-protocol.hh"
 
@@ -65,6 +67,10 @@ namespace jwm {
             &WindowWayland::onSurfacePreferredBufferScale,
             &WindowWayland::onSurfacePreferredBufferTransform
 #endif
+        };
+
+        wp_fractional_scale_v1_listener kFractionalScaleListener {
+            &WindowWayland::onFractionalScalePreferredScale
         };
 
         std::string _stringFromJava(JNIEnv* env, jstring str) {
@@ -276,20 +282,24 @@ void jwm::WindowWayland::close() {
 }
 
 jobject jwm::WindowWayland::getScreen(JNIEnv* env) {
+    float windowScale = static_cast<float>(_effectiveScaleNumerator()) / 120.f;
     ScreenInfoWayland screen;
     for (wl_output* output : _enteredOutputs) {
         if (_windowManager.tryGetScreenForOutput(output, screen)) {
+            screen.scale = windowScale;
             return screen.asJavaObject(env);
         }
     }
 
     auto screens = _windowManager.getScreens();
     if (!screens.empty()) {
-        return screens.front().asJavaObject(env);
+        ScreenInfoWayland fallback = screens.front();
+        fallback.scale = windowScale;
+        return fallback.asJavaObject(env);
     }
 
     IRect bounds = IRect::makeXYWH(0, 0, 1920, 1080);
-    return classes::Screen::make(env, 1, true, bounds, bounds, 1.f);
+    return classes::Screen::make(env, 1, true, bounds, bounds, windowScale);
 }
 
 void jwm::WindowWayland::requestFrame() {
@@ -389,8 +399,8 @@ void jwm::WindowWayland::toContentPixels(double logicalX, double logicalY, int& 
 }
 
 int jwm::WindowWayland::toContentPixels(double logicalValue) const {
-    int scale = std::max(_bufferScale, 1);
-    return static_cast<int>(std::lround(logicalValue * static_cast<double>(scale)));
+    double scale = static_cast<double>(_effectiveScaleNumerator()) / 120.0;
+    return static_cast<int>(std::lround(logicalValue * scale));
 }
 
 bool jwm::WindowWayland::hasEnteredOutput(wl_output* output) const {
@@ -409,6 +419,22 @@ void jwm::WindowWayland::handleOutputMetricsChanged(wl_output* output) {
     }
     _refreshScreenAssociation();
     _updateBufferScaleFromOutputs();
+}
+
+void jwm::WindowWayland::handleScaleProtocolGlobalsChanged() {
+    if (_isClosed) {
+        return;
+    }
+    if (_wlSurface == nullptr) {
+        return;
+    }
+    if (!_syncScaleProtocolObjects()) {
+        return;
+    }
+    _updateBufferScaleFromOutputs();
+    if (_isVisible) {
+        wl_surface_commit(_wlSurface);
+    }
 }
 
 jwm::WindowManagerWayland& jwm::WindowWayland::getWindowManager() {
@@ -470,6 +496,9 @@ void jwm::WindowWayland::onSurfaceLeave(void* data, wl_surface* surface, wl_outp
 void jwm::WindowWayland::onSurfacePreferredBufferScale(void* data, wl_surface* surface, int32_t factor) {
     (void) surface;
     WindowWayland* instance = static_cast<WindowWayland*>(data);
+    if (instance == nullptr || instance->_isClosed) {
+        return;
+    }
     if (factor <= 0) {
         return;
     }
@@ -486,6 +515,21 @@ void jwm::WindowWayland::onSurfacePreferredBufferTransform(void* data, wl_surfac
     (void) transform;
 }
 #endif
+
+void jwm::WindowWayland::onFractionalScalePreferredScale(void* data, wp_fractional_scale_v1* fractionalScale, uint32_t scale) {
+    WindowWayland* instance = static_cast<WindowWayland*>(data);
+    if (instance == nullptr || instance->_isClosed || instance->_wpFractionalScale != fractionalScale) {
+        return;
+    }
+    if (scale == 0) {
+        return;
+    }
+    instance->_preferredFractionalScaleNumerator = scale;
+    instance->_updateBufferScaleFromOutputs();
+    if (instance->_isVisible && instance->_wlSurface != nullptr) {
+        wl_surface_commit(instance->_wlSurface);
+    }
+}
 
 void jwm::WindowWayland::_handleSurfaceEnter(wl_output* output) {
     if (output == nullptr || hasEnteredOutput(output)) {
@@ -551,19 +595,32 @@ bool jwm::WindowWayland::_refreshScreenAssociation() {
 }
 
 bool jwm::WindowWayland::_updateBufferScaleFromOutputs() {
-    int nextScale = _resolveEnteredOutputScale();
-    if (nextScale == _bufferScale) {
+    uint32_t nextScaleNumerator = _resolveScaleNumerator();
+    bool fractionalScalingEnabled = _isFractionalScalingEnabled();
+    int nextBufferScale = fractionalScalingEnabled
+        ? 1
+        : std::max(1, static_cast<int>((nextScaleNumerator + 119u) / 120u));
+    bool scaleChanged = nextScaleNumerator != _scaleNumerator || nextBufferScale != _bufferScale;
+    if (!scaleChanged) {
         return false;
     }
-
-    _bufferScale = nextScale;
-
-    if (_wlSurface != nullptr) {
-        wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
-    }
+    _scaleNumerator = nextScaleNumerator;
+    _bufferScale = nextBufferScale;
 
     int logicalWidth = std::max(_logicalContentRect.getWidth(), 1);
     int logicalHeight = std::max(_logicalContentRect.getHeight(), 1);
+
+    if (_wlSurface != nullptr) {
+        wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
+        if (_wpViewport != nullptr) {
+            if (fractionalScalingEnabled) {
+                wp_viewport_set_destination(_wpViewport, logicalWidth, logicalHeight);
+            } else {
+                wp_viewport_set_destination(_wpViewport, -1, -1);
+            }
+        }
+    }
+
     int contentWidth = _toBufferPixels(logicalWidth);
     int contentHeight = _toBufferPixels(logicalHeight);
     int previousContentWidth = _contentRect.getWidth();
@@ -587,19 +644,37 @@ bool jwm::WindowWayland::_updateBufferScaleFromOutputs() {
 }
 
 int jwm::WindowWayland::_resolveEnteredOutputScale() const {
-    if (_preferredBufferScale > 0) {
-        return std::max(1, _preferredBufferScale);
-    }
-
     if (_enteredOutputs.empty()) {
-        return _resolveBufferScale();
+        return std::max(_bufferScale, 1);
     }
 
     int scale = 1;
     for (wl_output* output : _enteredOutputs) {
         scale = std::max(scale, _windowManager.getOutputScale(output));
     }
-    return scale;
+    return std::max(scale, 1);
+}
+
+uint32_t jwm::WindowWayland::_resolveScaleNumerator() const {
+    if (_preferredFractionalScaleNumerator > 0) {
+        uint32_t preferredNumerator = std::max(120u, _preferredFractionalScaleNumerator);
+        if (_isFractionalScalingEnabled()) {
+            return preferredNumerator;
+        }
+        return std::max(120u, ((preferredNumerator + 119u) / 120u) * 120u);
+    }
+    if (_preferredBufferScale > 0) {
+        return static_cast<uint32_t>(std::max(1, _preferredBufferScale)) * 120u;
+    }
+    return static_cast<uint32_t>(_resolveEnteredOutputScale()) * 120u;
+}
+
+uint32_t jwm::WindowWayland::_effectiveScaleNumerator() const {
+    return std::max(120u, _scaleNumerator);
+}
+
+bool jwm::WindowWayland::_isFractionalScalingEnabled() const {
+    return _wpViewport != nullptr && _wpFractionalScale != nullptr;
 }
 
 void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
@@ -624,9 +699,21 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
     bool isFirstConfigure = !_isConfigured;
     bool dispatchInitialFrame = false;
     _refreshScreenAssociation();
-    int nextBufferScale = _resolveEnteredOutputScale();
-    bool scaleChanged = nextBufferScale != _bufferScale;
+    uint32_t nextScaleNumerator = _resolveScaleNumerator();
+    bool fractionalScalingEnabled = _isFractionalScalingEnabled();
+    int nextBufferScale = fractionalScalingEnabled
+        ? 1
+        : std::max(1, static_cast<int>((nextScaleNumerator + 119u) / 120u));
+    _scaleNumerator = nextScaleNumerator;
     _bufferScale = nextBufferScale;
+    wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
+    if (_wpViewport != nullptr) {
+        if (fractionalScalingEnabled) {
+            wp_viewport_set_destination(_wpViewport, width, height);
+        } else {
+            wp_viewport_set_destination(_wpViewport, -1, -1);
+        }
+    }
 
     int contentWidth = _toBufferPixels(width);
     int contentHeight = _toBufferPixels(height);
@@ -641,10 +728,6 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
         } else {
             wl_surface_damage(_wlSurface, 0, 0, width, height);
         }
-    }
-
-    if (scaleChanged) {
-        wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
     }
 
     xdg_surface_set_window_geometry(_xdgSurface, 0, 0, width, height);
@@ -809,8 +892,21 @@ bool jwm::WindowWayland::_ensureSurface() {
             return false;
         }
         _windowManager.registerWindowSurface(_wlSurface, this);
-        _bufferScale = _resolveEnteredOutputScale();
+        if (!_syncScaleProtocolObjects()) {
+            _destroyScaleProtocolObjects();
+            _windowManager.unregisterWindowSurface(_wlSurface);
+            wl_surface_destroy(_wlSurface);
+            _wlSurface = nullptr;
+            return false;
+        }
+        _scaleNumerator = _resolveScaleNumerator();
+        _bufferScale = _isFractionalScalingEnabled()
+            ? 1
+            : std::max(1, static_cast<int>((_scaleNumerator + 119u) / 120u));
         wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
+        if (_wpViewport != nullptr && _isFractionalScalingEnabled()) {
+            wp_viewport_set_destination(_wpViewport, std::max(_logicalContentRect.getWidth(), 1), std::max(_logicalContentRect.getHeight(), 1));
+        }
     }
 
     if (_xdgSurface != nullptr && _xdgToplevel != nullptr) {
@@ -876,6 +972,69 @@ bool jwm::WindowWayland::_ensureSurface() {
     return true;
 }
 
+bool jwm::WindowWayland::_syncScaleProtocolObjects() {
+    if (_wlSurface == nullptr) {
+        return true;
+    }
+
+    if (_windowManager.getFractionalScaleManager() == nullptr && _wpFractionalScale != nullptr) {
+        wp_fractional_scale_v1_destroy(_wpFractionalScale);
+        _wpFractionalScale = nullptr;
+        _preferredFractionalScaleNumerator = 0;
+    }
+
+    if (_windowManager.getViewporter() == nullptr && _wpViewport != nullptr) {
+        wp_viewport_destroy(_wpViewport);
+        _wpViewport = nullptr;
+    }
+
+    if (_windowManager.getViewporter() != nullptr && _wpViewport == nullptr) {
+        _wpViewport = wp_viewporter_get_viewport(_windowManager.getViewporter(), _wlSurface);
+        if (_wpViewport == nullptr) {
+            JWM_LOG("Wayland: wp_viewporter_get_viewport failed");
+            return false;
+        }
+    }
+
+    if (_windowManager.getFractionalScaleManager() != nullptr && _wpFractionalScale == nullptr) {
+        _wpFractionalScale = wp_fractional_scale_manager_v1_get_fractional_scale(
+            _windowManager.getFractionalScaleManager(),
+            _wlSurface);
+        if (_wpFractionalScale == nullptr) {
+            JWM_LOG("Wayland: wp_fractional_scale_manager_v1_get_fractional_scale failed");
+            return false;
+        }
+        if (wp_fractional_scale_v1_add_listener(_wpFractionalScale, &kFractionalScaleListener, this) != 0) {
+            JWM_LOG("Wayland: wp_fractional_scale_v1_add_listener failed");
+            wp_fractional_scale_v1_destroy(_wpFractionalScale);
+            _wpFractionalScale = nullptr;
+            return false;
+        }
+    }
+
+    if (_wpViewport != nullptr) {
+        if (_isFractionalScalingEnabled()) {
+            wp_viewport_set_destination(_wpViewport, std::max(_logicalContentRect.getWidth(), 1), std::max(_logicalContentRect.getHeight(), 1));
+        } else {
+            wp_viewport_set_destination(_wpViewport, -1, -1);
+        }
+    }
+
+    return true;
+}
+
+void jwm::WindowWayland::_destroyScaleProtocolObjects() {
+    if (_wpFractionalScale != nullptr) {
+        wp_fractional_scale_v1_destroy(_wpFractionalScale);
+        _wpFractionalScale = nullptr;
+    }
+    if (_wpViewport != nullptr) {
+        wp_viewport_destroy(_wpViewport);
+        _wpViewport = nullptr;
+    }
+    _preferredFractionalScaleNumerator = 0;
+}
+
 void jwm::WindowWayland::_waitForShowHideSyncIfNeeded() {
     if (!_showHideSyncRequired) {
         return;
@@ -903,41 +1062,11 @@ void jwm::WindowWayland::_queueShowHideSync() {
     }
 }
 
-int jwm::WindowWayland::_resolveBufferScale() const {
-    auto screens = _windowManager.getScreens();
-    if (screens.empty()) {
-        return 1;
-    }
-    float scale = screens.front().scale;
-    if (_screenId != std::numeric_limits<long>::min()) {
-        for (const auto& candidate : screens) {
-            if (candidate.id == _screenId) {
-                scale = candidate.scale;
-                break;
-            }
-        }
-    } else {
-        int logicalX = _logicalContentRect.fLeft;
-        int logicalY = _logicalContentRect.fTop;
-        int logicalWidth = std::max(_logicalContentRect.getWidth(), 1);
-        int logicalHeight = std::max(_logicalContentRect.getHeight(), 1);
-        int centerX = logicalX + logicalWidth / 2;
-        int centerY = logicalY + logicalHeight / 2;
-        for (const auto& candidate : screens) {
-            if (candidate.bounds.isPointInside(centerX, centerY)) {
-                scale = candidate.scale;
-                break;
-            }
-        }
-    }
-    if (scale < 1.f) {
-        scale = 1.f;
-    }
-    return std::max(1, static_cast<int>(std::lround(scale)));
-}
-
 int jwm::WindowWayland::_toBufferPixels(int logicalValue) const {
-    return std::max(logicalValue, 1) * std::max(_bufferScale, 1);
+    int clampedLogical = std::max(logicalValue, 1);
+    uint32_t numerator = _effectiveScaleNumerator();
+    int64_t scaled = static_cast<int64_t>(clampedLogical) * static_cast<int64_t>(numerator);
+    return std::max(1, static_cast<int>((scaled + 60) / 120));
 }
 
 bool jwm::WindowWayland::_ensureShmBuffer(int width, int height) {
@@ -1065,7 +1194,9 @@ void jwm::WindowWayland::_destroySurface() {
     _isConfigured = false;
     _isFrameRequested = false;
     _bufferScale = 1;
+    _scaleNumerator = 120;
     _preferredBufferScale = 0;
+    _preferredFractionalScaleNumerator = 0;
     _isActivated = false;
     _isMinimized = false;
     _isMaximized = false;
@@ -1080,6 +1211,7 @@ void jwm::WindowWayland::_destroySurface() {
     _destroyFrameCallback();
     _destroyShmBuffer();
     _destroyRoleObjects();
+    _destroyScaleProtocolObjects();
     if (_wlSurface != nullptr) {
         _windowManager.unregisterWindowSurface(_wlSurface);
         wl_surface_destroy(_wlSurface);

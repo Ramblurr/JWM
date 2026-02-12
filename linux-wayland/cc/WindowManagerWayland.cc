@@ -27,8 +27,10 @@
 #include "impl/Library.hh"
 #include "xdg-activation-v1-client-protocol.hh"
 #include "xdg-decoration-unstable-v1-client-protocol.hh"
+#include "fractional-scale-v1-client-protocol.hh"
 #include "pointer-constraints-unstable-v1-client-protocol.hh"
 #include "relative-pointer-unstable-v1-client-protocol.hh"
+#include "viewporter-client-protocol.hh"
 #include "xdg-output-unstable-v1-client-protocol.hh"
 #include "xdg-shell-client-protocol.hh"
 
@@ -120,6 +122,7 @@ namespace {
             default: return {"default", "left_ptr"};
         }
     }
+
 }
 
 struct jwm::WaylandOutputState {
@@ -415,6 +418,18 @@ void jwm::WindowManagerWayland::_cleanup() {
     }
     _activationManagerName = std::numeric_limits<uint32_t>::max();
 
+    if (_fractionalScaleManager != nullptr) {
+        wp_fractional_scale_manager_v1_destroy(_fractionalScaleManager);
+        _fractionalScaleManager = nullptr;
+    }
+    _fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
+
+    if (_viewporter != nullptr) {
+        wp_viewporter_destroy(_viewporter);
+        _viewporter = nullptr;
+    }
+    _viewporterName = std::numeric_limits<uint32_t>::max();
+
     if (_decorationManager != nullptr) {
         zxdg_decoration_manager_v1_destroy(_decorationManager);
         _decorationManager = nullptr;
@@ -513,13 +528,11 @@ void jwm::WindowManagerWayland::_rebuildScreens() {
             continue;
         }
 
-        float outputScale = static_cast<float>(std::max(1, output.scale));
-
         ScreenInfoWayland screenInfo = {
             static_cast<long>(output.name),
             IRect::makeXYWH(boundsX, boundsY, boundsWidth, boundsHeight),
             false,
-            outputScale
+            static_cast<float>(std::max(1, output.scale))
         };
         screens.push_back(screenInfo);
     }
@@ -731,6 +744,66 @@ bool jwm::WindowManagerWayland::_bindActivationManager(wl_registry* registry, ui
     return true;
 }
 
+bool jwm::WindowManagerWayland::_bindViewporter(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_viewporter != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _viewporter = static_cast<wp_viewporter*>(
+        wl_registry_bind(registry, name, &wp_viewporter_interface, bindVersion));
+    if (_viewporter == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wp_viewporter) failed");
+        return false;
+    }
+    _viewporterName = name;
+    _notifyWindowsScaleCapabilityChanged();
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindFractionalScaleManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_fractionalScaleManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _fractionalScaleManager = static_cast<wp_fractional_scale_manager_v1*>(
+        wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, bindVersion));
+    if (_fractionalScaleManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wp_fractional_scale_manager_v1) failed");
+        return false;
+    }
+    _fractionalScaleManagerName = name;
+    _notifyWindowsScaleCapabilityChanged();
+    return true;
+}
+
+void jwm::WindowManagerWayland::_notifyWindowsOutputMetricsChanged(wl_output* output) {
+    std::vector<WindowWayland*> windows;
+    windows.reserve(_surfaceToWindow.size());
+    for (const auto& surfaceEntry : _surfaceToWindow) {
+        windows.push_back(surfaceEntry.second);
+    }
+    for (WindowWayland* window : windows) {
+        if (window != nullptr) {
+            window->handleOutputMetricsChanged(output);
+        }
+    }
+}
+
+void jwm::WindowManagerWayland::_notifyWindowsScaleCapabilityChanged() {
+    std::vector<WindowWayland*> windows;
+    windows.reserve(_surfaceToWindow.size());
+    for (const auto& surfaceEntry : _surfaceToWindow) {
+        windows.push_back(surfaceEntry.second);
+    }
+    for (WindowWayland* window : windows) {
+        if (window != nullptr) {
+            window->handleScaleProtocolGlobalsChanged();
+        }
+    }
+}
+
 void jwm::WindowManagerWayland::_cancelActivationRequest() {
     if (_activationToken != nullptr) {
         xdg_activation_token_v1_destroy(_activationToken);
@@ -758,6 +831,14 @@ xdg_wm_base* jwm::WindowManagerWayland::getXdgWmBase() const {
 
 zxdg_decoration_manager_v1* jwm::WindowManagerWayland::getDecorationManager() const {
     return _decorationManager;
+}
+
+wp_viewporter* jwm::WindowManagerWayland::getViewporter() const {
+    return _viewporter;
+}
+
+wp_fractional_scale_manager_v1* jwm::WindowManagerWayland::getFractionalScaleManager() const {
+    return _fractionalScaleManager;
 }
 
 uint32_t jwm::WindowManagerWayland::getCompositorVersion() const {
@@ -1596,6 +1677,14 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
         manager->_bindActivationManager(registry, name, version);
         return;
     }
+    if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+        manager->_bindViewporter(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
+        manager->_bindFractionalScaleManager(registry, name, version);
+        return;
+    }
     if (strcmp(interface, wl_output_interface.name) != 0) {
         return;
     }
@@ -1697,6 +1786,24 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         manager->_activationManagerName = std::numeric_limits<uint32_t>::max();
         return;
     }
+    if (name == manager->_viewporterName) {
+        if (manager->_viewporter != nullptr) {
+            wp_viewporter_destroy(manager->_viewporter);
+            manager->_viewporter = nullptr;
+        }
+        manager->_viewporterName = std::numeric_limits<uint32_t>::max();
+        manager->_notifyWindowsScaleCapabilityChanged();
+        return;
+    }
+    if (name == manager->_fractionalScaleManagerName) {
+        if (manager->_fractionalScaleManager != nullptr) {
+            wp_fractional_scale_manager_v1_destroy(manager->_fractionalScaleManager);
+            manager->_fractionalScaleManager = nullptr;
+        }
+        manager->_fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
+        manager->_notifyWindowsScaleCapabilityChanged();
+        return;
+    }
     if (name == manager->_xdgOutputManagerName) {
         manager->_clearXdgOutputBindings();
         if (manager->_xdgOutputManager != nullptr) {
@@ -1705,6 +1812,7 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         }
         manager->_xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
         manager->_rebuildScreens();
+        manager->_notifyWindowsOutputMetricsChanged(nullptr);
         return;
     }
     auto outputIt = manager->_outputByName.find(name);
@@ -1719,23 +1827,16 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
     wl_output_destroy(outputIt->second->output);
     manager->_outputByName.erase(outputIt);
     manager->_rebuildScreens();
-    std::vector<WindowWayland*> windows;
-    windows.reserve(manager->_surfaceToWindow.size());
-    for (const auto& surfaceEntry : manager->_surfaceToWindow) {
-        windows.push_back(surfaceEntry.second);
-    }
-    for (WindowWayland* window : windows) {
-        if (window != nullptr) {
-            window->handleOutputMetricsChanged(removedOutput);
-        }
-    }
+    manager->_notifyWindowsOutputMetricsChanged(removedOutput);
 }
 
 void jwm::WindowManagerWayland::onOutputGeometry(void* data, wl_output* output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char* make, const char* model, int32_t transform) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->x = x;
     outputState->y = y;
+    (void) transform;
     outputState->manager->_rebuildScreens();
+    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
 }
 
 void jwm::WindowManagerWayland::onOutputMode(void* data, wl_output* output, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
@@ -1746,6 +1847,7 @@ void jwm::WindowManagerWayland::onOutputMode(void* data, wl_output* output, uint
         outputState->hasMode = true;
     }
     outputState->manager->_rebuildScreens();
+    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
 }
 
 void jwm::WindowManagerWayland::onOutputDone(void* data, wl_output* output) {
@@ -1757,16 +1859,7 @@ void jwm::WindowManagerWayland::onOutputScale(void* data, wl_output* output, int
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->scale = std::max(1, factor);
     outputState->manager->_rebuildScreens();
-    std::vector<WindowWayland*> windows;
-    windows.reserve(outputState->manager->_surfaceToWindow.size());
-    for (const auto& surfaceEntry : outputState->manager->_surfaceToWindow) {
-        windows.push_back(surfaceEntry.second);
-    }
-    for (WindowWayland* window : windows) {
-        if (window != nullptr) {
-            window->handleOutputMetricsChanged(output);
-        }
-    }
+    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_output_v1* xdgOutput, int32_t x, int32_t y) {
@@ -1775,6 +1868,7 @@ void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_outp
     outputState->logicalY = y;
     outputState->hasLogicalPosition = true;
     outputState->manager->_rebuildScreens();
+    outputState->manager->_notifyWindowsOutputMetricsChanged(outputState->output);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalSize(void* data, zxdg_output_v1* xdgOutput, int32_t width, int32_t height) {
@@ -1783,6 +1877,7 @@ void jwm::WindowManagerWayland::onXdgOutputLogicalSize(void* data, zxdg_output_v
     outputState->logicalHeight = height;
     outputState->hasLogicalSize = true;
     outputState->manager->_rebuildScreens();
+    outputState->manager->_notifyWindowsOutputMetricsChanged(outputState->output);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputDone(void* data, zxdg_output_v1* xdgOutput) {
