@@ -41,6 +41,13 @@ public class Example implements Consumer<Event> {
 
     public Options progressBars = new Options("Default", "0%", "50%", "100%", "Indeterminate");
 
+    private void updateFontsForScale(float scale) {
+        FONT12.setSize(12 * scale);
+        FONT24.setSize(24 * scale);
+        FONT48.setSize(48 * scale);
+        lastScale = scale;
+    }
+
     public Example() {
         window = App.makeWindow();
         window.setEventListener(this);
@@ -57,6 +64,7 @@ public class Example implements Consumer<Event> {
         panelTouch = new PanelTouch(window);
 
         var scale = window.getScreen().getScale();
+        updateFontsForScale(scale);
         int count = App._windows.size() - 1;
         Screen screen = App.getScreens()[(count / 5) % App.getScreens().length];
         IRect bounds = screen.getWorkArea();
@@ -114,9 +122,7 @@ public class Example implements Consumer<Event> {
             return;
 
         if (lastScale != scale) {
-            FONT12.setSize(12 * scale);
-            FONT24.setSize(24 * scale);
-            FONT48.setSize(48 * scale);
+            updateFontsForScale(scale);
         }
 
         canvas.clear(0xFF264653);
