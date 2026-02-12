@@ -25,6 +25,8 @@
 #include "WindowWayland.hh"
 #include "impl/JNILocal.hh"
 #include "impl/Library.hh"
+#include "pointer-constraints-unstable-v1-client-protocol.hh"
+#include "relative-pointer-unstable-v1-client-protocol.hh"
 #include "xdg-output-unstable-v1-client-protocol.hh"
 #include "xdg-shell-client-protocol.hh"
 
@@ -81,6 +83,15 @@ namespace {
         &jwm::WindowManagerWayland::onKeyboardKey,
         &jwm::WindowManagerWayland::onKeyboardModifiers,
         &jwm::WindowManagerWayland::onKeyboardRepeatInfo
+    };
+
+    zwp_relative_pointer_v1_listener kRelativePointerListener {
+        &jwm::WindowManagerWayland::onRelativePointerMotion
+    };
+
+    zwp_locked_pointer_v1_listener kLockedPointerListener {
+        &jwm::WindowManagerWayland::onLockedPointerLocked,
+        &jwm::WindowManagerWayland::onLockedPointerUnlocked
     };
 
     constexpr xkb_keycode_t kXkbKeycodeOffset = 8;
@@ -205,6 +216,10 @@ bool jwm::WindowManagerWayland::connect() {
 }
 
 void jwm::WindowManagerWayland::_resetPointer() {
+    _destroyLockedPointer();
+    _destroyRelativePointer();
+    _pointerLockWindow = nullptr;
+    _isPointerLockActive = false;
     _pointerFocusWindow = nullptr;
     _pointerEnterSerial = 0;
     _pointerContentX = 0;
@@ -235,6 +250,91 @@ void jwm::WindowManagerWayland::_resetPointer() {
         }
         _pointer = nullptr;
     }
+}
+
+void jwm::WindowManagerWayland::_destroyRelativePointer() {
+    if (_relativePointer == nullptr) {
+        return;
+    }
+    zwp_relative_pointer_v1_destroy(_relativePointer);
+    _relativePointer = nullptr;
+}
+
+void jwm::WindowManagerWayland::_destroyLockedPointer() {
+    if (_lockedPointer == nullptr) {
+        return;
+    }
+    zwp_locked_pointer_v1_destroy(_lockedPointer);
+    _lockedPointer = nullptr;
+}
+
+void jwm::WindowManagerWayland::_updatePointerLock() {
+    WindowWayland* focusWindow = _pointerFocusWindow;
+    bool hasRequest = false;
+    if (focusWindow != nullptr) {
+        auto requestIt = _pointerLockRequests.find(focusWindow);
+        if (requestIt != _pointerLockRequests.end()) {
+            hasRequest = requestIt->second;
+        }
+    }
+
+    bool isEligible = focusWindow != nullptr &&
+        hasRequest &&
+        focusWindow == _keyboardFocusWindow &&
+        _pointer != nullptr &&
+        _pointerConstraints != nullptr &&
+        _relativePointerManager != nullptr &&
+        focusWindow->getSurface() != nullptr;
+
+    if (!isEligible) {
+        _destroyLockedPointer();
+        _destroyRelativePointer();
+        _pointerLockWindow = nullptr;
+        _isPointerLockActive = false;
+        _applyCursorForFocus();
+        return;
+    }
+
+    if (_relativePointer == nullptr) {
+        _relativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer(_relativePointerManager, _pointer);
+        if (_relativePointer == nullptr) {
+            JWM_LOG("Wayland: zwp_relative_pointer_manager_v1_get_relative_pointer failed");
+            _applyCursorForFocus();
+            return;
+        }
+        if (zwp_relative_pointer_v1_add_listener(_relativePointer, &kRelativePointerListener, this) != 0) {
+            JWM_LOG("Wayland: zwp_relative_pointer_v1_add_listener failed");
+            _destroyRelativePointer();
+            _applyCursorForFocus();
+            return;
+        }
+    }
+
+    if (_lockedPointer == nullptr) {
+        _lockedPointer = zwp_pointer_constraints_v1_lock_pointer(
+            _pointerConstraints,
+            focusWindow->getSurface(),
+            _pointer,
+            nullptr,
+            ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT
+        );
+        if (_lockedPointer == nullptr) {
+            JWM_LOG("Wayland: zwp_pointer_constraints_v1_lock_pointer failed");
+            _destroyRelativePointer();
+            _applyCursorForFocus();
+            return;
+        }
+        if (zwp_locked_pointer_v1_add_listener(_lockedPointer, &kLockedPointerListener, this) != 0) {
+            JWM_LOG("Wayland: zwp_locked_pointer_v1_add_listener failed");
+            _destroyLockedPointer();
+            _destroyRelativePointer();
+            _applyCursorForFocus();
+            return;
+        }
+    }
+
+    _pointerLockWindow = focusWindow;
+    _applyCursorForFocus();
 }
 
 void jwm::WindowManagerWayland::_resetKeyboard() {
@@ -288,6 +388,18 @@ void jwm::WindowManagerWayland::_cleanup() {
 
     _resetSeat();
     _destroyCursorResources();
+    _pointerLockRequests.clear();
+
+    if (_relativePointerManager != nullptr) {
+        zwp_relative_pointer_manager_v1_destroy(_relativePointerManager);
+        _relativePointerManager = nullptr;
+    }
+    _relativePointerManagerName = std::numeric_limits<uint32_t>::max();
+    if (_pointerConstraints != nullptr) {
+        zwp_pointer_constraints_v1_destroy(_pointerConstraints);
+        _pointerConstraints = nullptr;
+    }
+    _pointerConstraintsName = std::numeric_limits<uint32_t>::max();
 
     _clearXdgOutputBindings();
 
@@ -532,6 +644,40 @@ bool jwm::WindowManagerWayland::_bindSeat(wl_registry* registry, uint32_t name, 
     return true;
 }
 
+bool jwm::WindowManagerWayland::_bindPointerConstraints(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_pointerConstraints != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _pointerConstraints = static_cast<zwp_pointer_constraints_v1*>(
+        wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, bindVersion));
+    if (_pointerConstraints == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(zwp_pointer_constraints_v1) failed");
+        return false;
+    }
+    _pointerConstraintsName = name;
+    _updatePointerLock();
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindRelativePointerManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_relativePointerManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _relativePointerManager = static_cast<zwp_relative_pointer_manager_v1*>(
+        wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, bindVersion));
+    if (_relativePointerManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(zwp_relative_pointer_manager_v1) failed");
+        return false;
+    }
+    _relativePointerManagerName = name;
+    _updatePointerLock();
+    return true;
+}
+
 wl_display* jwm::WindowManagerWayland::getDisplay() const {
     return _display;
 }
@@ -579,6 +725,7 @@ void jwm::WindowManagerWayland::unregisterWindowSurface(wl_surface* surface) {
 
     WindowWayland* window = it->second;
     _surfaceToWindow.erase(it);
+    _pointerLockRequests.erase(window);
 
     if (_pointerFocusWindow == window) {
         _pointerFocusWindow = nullptr;
@@ -600,11 +747,84 @@ void jwm::WindowManagerWayland::unregisterWindowSurface(wl_surface* surface) {
     if (_pendingCursorWindow == window) {
         _pendingCursorWindow = nullptr;
     }
+
+    _updatePointerLock();
 }
 
 void jwm::WindowManagerWayland::requestCursorUpdate(WindowWayland* window) {
     _pendingCursorWindow = window;
     _applyCursorForFocus();
+}
+
+void jwm::WindowManagerWayland::requestPointerLock(WindowWayland* window, bool isLocked) {
+    if (window == nullptr) {
+        return;
+    }
+
+    if (isLocked) {
+        _pointerLockRequests[window] = true;
+    } else {
+        _pointerLockRequests.erase(window);
+    }
+
+    _updatePointerLock();
+}
+
+bool jwm::WindowManagerWayland::tryGetScreenForOutput(wl_output* output, ScreenInfoWayland& screen) const {
+    if (output == nullptr) {
+        return false;
+    }
+
+    for (const auto& entry : _outputByName) {
+        const WaylandOutputState& outputState = *entry.second;
+        if (outputState.output != output || !outputState.hasMode || outputState.width <= 0 || outputState.height <= 0) {
+            continue;
+        }
+
+        int32_t boundsX = outputState.hasLogicalPosition ? outputState.logicalX : outputState.x;
+        int32_t boundsY = outputState.hasLogicalPosition ? outputState.logicalY : outputState.y;
+        int32_t boundsWidth = outputState.hasLogicalSize ? outputState.logicalWidth : outputState.width;
+        int32_t boundsHeight = outputState.hasLogicalSize ? outputState.logicalHeight : outputState.height;
+        if (boundsWidth <= 0 || boundsHeight <= 0) {
+            return false;
+        }
+
+        screen = ScreenInfoWayland {
+            static_cast<long>(outputState.name),
+            IRect::makeXYWH(boundsX, boundsY, boundsWidth, boundsHeight),
+            false,
+            static_cast<float>(std::max(1, outputState.scale))
+        };
+        return true;
+    }
+
+    return false;
+}
+
+int jwm::WindowManagerWayland::getOutputScale(wl_output* output) const {
+    if (output == nullptr) {
+        return 1;
+    }
+
+    for (const auto& entry : _outputByName) {
+        if (entry.second->output == output) {
+            return std::max(1, entry.second->scale);
+        }
+    }
+    return 1;
+}
+
+bool jwm::WindowManagerWayland::hasOutput(wl_output* output) const {
+    if (output == nullptr) {
+        return false;
+    }
+
+    for (const auto& entry : _outputByName) {
+        if (entry.second->output == output) {
+            return true;
+        }
+    }
+    return false;
 }
 
 jwm::WindowWayland* jwm::WindowManagerWayland::_windowBySurface(wl_surface* surface) const {
@@ -689,6 +909,12 @@ void jwm::WindowManagerWayland::_destroyCursorResources() {
 
 void jwm::WindowManagerWayland::_applyCursorForFocus() {
     if (_pointer == nullptr || _pointerFocusWindow == nullptr || _pointerEnterSerial == 0) {
+        return;
+    }
+
+    if (_isPointerLockActive && _pointerLockWindow == _pointerFocusWindow) {
+        wl_pointer_set_cursor(_pointer, _pointerEnterSerial, nullptr, 0, 0);
+        _pendingCursorWindow = nullptr;
         return;
     }
 
@@ -1059,6 +1285,7 @@ void jwm::WindowManagerWayland::_handleKeyboardFocusEnter(WindowWayland* window,
     if (focusChanged && window != nullptr) {
         window->dispatch(classes::EventWindowFocusIn::kInstance);
     }
+    _updatePointerLock();
 }
 
 void jwm::WindowManagerWayland::_handleKeyboardFocusLeave(bool dispatchFocusOut) {
@@ -1091,6 +1318,7 @@ void jwm::WindowManagerWayland::_handleKeyboardFocusLeave(bool dispatchFocusOut)
     if (dispatchFocusOut && focusedWindow != nullptr) {
         focusedWindow->dispatch(classes::EventWindowFocusOut::kInstance);
     }
+    _updatePointerLock();
     _isHandlingKeyboardFocusLeave = false;
 }
 
@@ -1223,6 +1451,14 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
         manager->_bindSeat(registry, name, version);
         return;
     }
+    if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
+        manager->_bindPointerConstraints(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        manager->_bindRelativePointerManager(registry, name, version);
+        return;
+    }
     if (strcmp(interface, wl_output_interface.name) != 0) {
         return;
     }
@@ -1281,6 +1517,32 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         manager->_resetSeat();
         return;
     }
+    if (name == manager->_pointerConstraintsName) {
+        manager->_destroyLockedPointer();
+        manager->_destroyRelativePointer();
+        manager->_pointerLockWindow = nullptr;
+        manager->_isPointerLockActive = false;
+        if (manager->_pointerConstraints != nullptr) {
+            zwp_pointer_constraints_v1_destroy(manager->_pointerConstraints);
+            manager->_pointerConstraints = nullptr;
+        }
+        manager->_pointerConstraintsName = std::numeric_limits<uint32_t>::max();
+        manager->_applyCursorForFocus();
+        return;
+    }
+    if (name == manager->_relativePointerManagerName) {
+        manager->_destroyLockedPointer();
+        manager->_destroyRelativePointer();
+        manager->_pointerLockWindow = nullptr;
+        manager->_isPointerLockActive = false;
+        if (manager->_relativePointerManager != nullptr) {
+            zwp_relative_pointer_manager_v1_destroy(manager->_relativePointerManager);
+            manager->_relativePointerManager = nullptr;
+        }
+        manager->_relativePointerManagerName = std::numeric_limits<uint32_t>::max();
+        manager->_applyCursorForFocus();
+        return;
+    }
     if (name == manager->_xdgOutputManagerName) {
         manager->_clearXdgOutputBindings();
         if (manager->_xdgOutputManager != nullptr) {
@@ -1299,9 +1561,20 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         zxdg_output_v1_destroy(outputIt->second->xdgOutput);
         outputIt->second->xdgOutput = nullptr;
     }
+    wl_output* removedOutput = outputIt->second->output;
     wl_output_destroy(outputIt->second->output);
     manager->_outputByName.erase(outputIt);
     manager->_rebuildScreens();
+    std::vector<WindowWayland*> windows;
+    windows.reserve(manager->_surfaceToWindow.size());
+    for (const auto& surfaceEntry : manager->_surfaceToWindow) {
+        windows.push_back(surfaceEntry.second);
+    }
+    for (WindowWayland* window : windows) {
+        if (window != nullptr) {
+            window->handleOutputMetricsChanged(removedOutput);
+        }
+    }
 }
 
 void jwm::WindowManagerWayland::onOutputGeometry(void* data, wl_output* output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char* make, const char* model, int32_t transform) {
@@ -1330,6 +1603,16 @@ void jwm::WindowManagerWayland::onOutputScale(void* data, wl_output* output, int
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
     outputState->scale = std::max(1, factor);
     outputState->manager->_rebuildScreens();
+    std::vector<WindowWayland*> windows;
+    windows.reserve(outputState->manager->_surfaceToWindow.size());
+    for (const auto& surfaceEntry : outputState->manager->_surfaceToWindow) {
+        windows.push_back(surfaceEntry.second);
+    }
+    for (WindowWayland* window : windows) {
+        if (window != nullptr) {
+            window->handleOutputMetricsChanged(output);
+        }
+    }
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_output_v1* xdgOutput, int32_t x, int32_t y) {
@@ -1385,6 +1668,7 @@ void jwm::WindowManagerWayland::onSeatCapabilities(void* data, wl_seat* seat, ui
     } else if (!hasPointer && manager->_pointer != nullptr) {
         manager->_resetPointer();
     }
+    manager->_updatePointerLock();
 
     bool hasKeyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
     if (hasKeyboard && manager->_keyboard == nullptr) {
@@ -1398,6 +1682,7 @@ void jwm::WindowManagerWayland::onSeatCapabilities(void* data, wl_seat* seat, ui
     } else if (!hasKeyboard && manager->_keyboard != nullptr) {
         manager->_resetKeyboard();
     }
+    manager->_updatePointerLock();
 }
 
 void jwm::WindowManagerWayland::onSeatName(void* data, wl_seat* seat, const char* name) {
@@ -1420,23 +1705,32 @@ void jwm::WindowManagerWayland::onPointerEnter(void* data, wl_pointer* pointer, 
     window->toContentPixels(wl_fixed_to_double(sx), wl_fixed_to_double(sy), manager->_pointerContentX, manager->_pointerContentY);
 
     manager->_dispatchMouseMove(window, 0, 0);
+    manager->_updatePointerLock();
     manager->_applyCursorForFocus();
 }
 
 void jwm::WindowManagerWayland::onPointerLeave(void* data, wl_pointer* pointer, uint32_t serial, wl_surface* surface) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
     manager->_flushPointerAxis();
+    manager->_destroyLockedPointer();
+    manager->_destroyRelativePointer();
+    manager->_pointerLockWindow = nullptr;
+    manager->_isPointerLockActive = false;
     manager->_pointerFocusWindow = nullptr;
     manager->_pointerEnterSerial = 0;
     manager->_pointerButtonMask = 0;
     manager->_pointerAxisValue120Pending = false;
     manager->_pointerAxisValue120X = 0.0;
     manager->_pointerAxisValue120Y = 0.0;
+    manager->_updatePointerLock();
 }
 
 void jwm::WindowManagerWayland::onPointerMotion(void* data, wl_pointer* pointer, uint32_t time, int32_t sx, int32_t sy) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
     if (manager->_pointerFocusWindow == nullptr) {
+        return;
+    }
+    if (manager->_isPointerLockActive && manager->_pointerLockWindow == manager->_pointerFocusWindow) {
         return;
     }
 
@@ -1551,6 +1845,45 @@ void jwm::WindowManagerWayland::onPointerAxisRelativeDirection(void* data, wl_po
     (void) pointer;
     (void) axis;
     (void) direction;
+}
+
+void jwm::WindowManagerWayland::onRelativePointerMotion(void* data, zwp_relative_pointer_v1* relativePointer, uint32_t utimeHi, uint32_t utimeLo, int32_t dx, int32_t dy, int32_t dxUnaccel, int32_t dyUnaccel) {
+    (void) relativePointer;
+    (void) utimeHi;
+    (void) utimeLo;
+    (void) dxUnaccel;
+    (void) dyUnaccel;
+
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (!manager->_isPointerLockActive || manager->_pointerLockWindow == nullptr) {
+        return;
+    }
+
+    int movementX = manager->_pointerLockWindow->toContentPixels(wl_fixed_to_double(dx));
+    int movementY = manager->_pointerLockWindow->toContentPixels(wl_fixed_to_double(dy));
+    if (movementX == 0 && movementY == 0) {
+        return;
+    }
+
+    manager->_dispatchMouseMove(manager->_pointerLockWindow, movementX, movementY);
+}
+
+void jwm::WindowManagerWayland::onLockedPointerLocked(void* data, zwp_locked_pointer_v1* lockedPointer) {
+    (void) lockedPointer;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_isPointerLockActive = true;
+    manager->_applyCursorForFocus();
+}
+
+void jwm::WindowManagerWayland::onLockedPointerUnlocked(void* data, zwp_locked_pointer_v1* lockedPointer) {
+    (void) lockedPointer;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_isPointerLockActive = false;
+    manager->_destroyLockedPointer();
+    manager->_destroyRelativePointer();
+    manager->_pointerLockWindow = nullptr;
+    manager->_applyCursorForFocus();
+    manager->_updatePointerLock();
 }
 
 void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboard, uint32_t format, int32_t fd, uint32_t size) {

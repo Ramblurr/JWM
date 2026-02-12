@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <vector>
 
 #include <jni.h>
 
@@ -15,6 +17,7 @@ struct wl_buffer;
 struct wl_callback;
 struct wl_egl_window;
 struct wl_surface;
+struct wl_output;
 struct wl_array;
 struct xdg_surface;
 struct xdg_toplevel;
@@ -51,6 +54,8 @@ namespace jwm {
         uint64_t getEglWindowSerial() const;
         void toContentPixels(double logicalX, double logicalY, int& x, int& y) const;
         int toContentPixels(double logicalValue) const;
+        bool hasEnteredOutput(wl_output* output) const;
+        void handleOutputMetricsChanged(wl_output* output);
 
         WindowManagerWayland& getWindowManager();
 
@@ -59,10 +64,21 @@ namespace jwm {
         static void onXdgToplevelClose(void* data, xdg_toplevel* xdgToplevel);
         static void onFrameDone(void* data, wl_callback* callback, uint32_t callbackData);
         static void onShowHideSyncDone(void* data, wl_callback* callback, uint32_t callbackData);
+        static void onSurfaceEnter(void* data, wl_surface* surface, wl_output* output);
+        static void onSurfaceLeave(void* data, wl_surface* surface, wl_output* output);
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+        static void onSurfacePreferredBufferScale(void* data, wl_surface* surface, int32_t factor);
+        static void onSurfacePreferredBufferTransform(void* data, wl_surface* surface, uint32_t transform);
+#endif
 
         void _handleXdgSurfaceConfigure(uint32_t serial);
         void _handleXdgToplevelConfigure(int32_t width, int32_t height);
         void _handleFrameDone(wl_callback* callback);
+        void _handleSurfaceEnter(wl_output* output);
+        void _handleSurfaceLeave(wl_output* output);
+        bool _refreshScreenAssociation();
+        bool _updateBufferScaleFromOutputs();
+        int _resolveEnteredOutputScale() const;
         bool _armFrameCallbackIfNeeded();
         bool _ensureSurface();
         void _waitForShowHideSyncIfNeeded();
@@ -109,6 +125,8 @@ namespace jwm {
         bool _isClosed = false;
         bool _isFrameRequested = false;
         bool _showHideSyncRequired = false;
+        long _screenId = std::numeric_limits<long>::min();
+        std::vector<wl_output*> _enteredOutputs;
 
         std::string _title;
         std::string _appId;

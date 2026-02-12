@@ -52,6 +52,16 @@ namespace jwm {
             &WindowWayland::onShowHideSyncDone
         };
 
+        wl_surface_listener kSurfaceListener {
+            &WindowWayland::onSurfaceEnter,
+            &WindowWayland::onSurfaceLeave
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+            ,
+            &WindowWayland::onSurfacePreferredBufferScale,
+            &WindowWayland::onSurfacePreferredBufferTransform
+#endif
+        };
+
         std::string _stringFromJava(JNIEnv* env, jstring str) {
             if (str == nullptr) {
                 return "";
@@ -202,6 +212,13 @@ void jwm::WindowWayland::close() {
 }
 
 jobject jwm::WindowWayland::getScreen(JNIEnv* env) {
+    ScreenInfoWayland screen;
+    for (wl_output* output : _enteredOutputs) {
+        if (_windowManager.tryGetScreenForOutput(output, screen)) {
+            return screen.asJavaObject(env);
+        }
+    }
+
     auto screens = _windowManager.getScreens();
     if (!screens.empty()) {
         return screens.front().asJavaObject(env);
@@ -312,6 +329,27 @@ int jwm::WindowWayland::toContentPixels(double logicalValue) const {
     return static_cast<int>(std::lround(logicalValue * static_cast<double>(scale)));
 }
 
+bool jwm::WindowWayland::hasEnteredOutput(wl_output* output) const {
+    if (output == nullptr) {
+        return false;
+    }
+    return std::find(_enteredOutputs.begin(), _enteredOutputs.end(), output) != _enteredOutputs.end();
+}
+
+void jwm::WindowWayland::handleOutputMetricsChanged(wl_output* output) {
+    if (output != nullptr) {
+        auto it = std::find(_enteredOutputs.begin(), _enteredOutputs.end(), output);
+        if (it == _enteredOutputs.end()) {
+            return;
+        }
+        if (!_windowManager.hasOutput(output)) {
+            _enteredOutputs.erase(it);
+        }
+    }
+    _refreshScreenAssociation();
+    _updateBufferScaleFromOutputs();
+}
+
 jwm::WindowManagerWayland& jwm::WindowWayland::getWindowManager() {
     return _windowManager;
 }
@@ -349,6 +387,130 @@ void jwm::WindowWayland::onShowHideSyncDone(void* data, wl_callback* callback, u
     instance->_showHideSyncRequired = false;
 }
 
+void jwm::WindowWayland::onSurfaceEnter(void* data, wl_surface* surface, wl_output* output) {
+    (void) surface;
+    WindowWayland* instance = static_cast<WindowWayland*>(data);
+    instance->_handleSurfaceEnter(output);
+}
+
+void jwm::WindowWayland::onSurfaceLeave(void* data, wl_surface* surface, wl_output* output) {
+    (void) surface;
+    WindowWayland* instance = static_cast<WindowWayland*>(data);
+    instance->_handleSurfaceLeave(output);
+}
+
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+void jwm::WindowWayland::onSurfacePreferredBufferScale(void* data, wl_surface* surface, int32_t factor) {
+    (void) data;
+    (void) surface;
+    (void) factor;
+}
+
+void jwm::WindowWayland::onSurfacePreferredBufferTransform(void* data, wl_surface* surface, uint32_t transform) {
+    (void) data;
+    (void) surface;
+    (void) transform;
+}
+#endif
+
+void jwm::WindowWayland::_handleSurfaceEnter(wl_output* output) {
+    if (output == nullptr || hasEnteredOutput(output)) {
+        return;
+    }
+    _enteredOutputs.push_back(output);
+    _refreshScreenAssociation();
+    _updateBufferScaleFromOutputs();
+}
+
+void jwm::WindowWayland::_handleSurfaceLeave(wl_output* output) {
+    if (output == nullptr) {
+        return;
+    }
+
+    auto it = std::find(_enteredOutputs.begin(), _enteredOutputs.end(), output);
+    if (it == _enteredOutputs.end()) {
+        return;
+    }
+    _enteredOutputs.erase(it);
+    _refreshScreenAssociation();
+    _updateBufferScaleFromOutputs();
+}
+
+bool jwm::WindowWayland::_refreshScreenAssociation() {
+    long nextScreenId = std::numeric_limits<long>::min();
+    bool hasScreen = false;
+    ScreenInfoWayland screen;
+    for (wl_output* output : _enteredOutputs) {
+        if (_windowManager.tryGetScreenForOutput(output, screen)) {
+            nextScreenId = screen.id;
+            hasScreen = true;
+            break;
+        }
+    }
+
+    if (!hasScreen) {
+        auto screens = _windowManager.getScreens();
+        if (!screens.empty()) {
+            nextScreenId = screens.front().id;
+        }
+    }
+
+    if (nextScreenId == _screenId) {
+        return false;
+    }
+    _screenId = nextScreenId;
+    dispatch(classes::EventWindowScreenChange::kInstance);
+    return true;
+}
+
+bool jwm::WindowWayland::_updateBufferScaleFromOutputs() {
+    int nextScale = _resolveEnteredOutputScale();
+    if (nextScale == _bufferScale) {
+        return false;
+    }
+
+    _bufferScale = nextScale;
+
+    if (_wlSurface != nullptr) {
+        wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
+    }
+
+    int logicalWidth = std::max(_logicalContentRect.getWidth(), 1);
+    int logicalHeight = std::max(_logicalContentRect.getHeight(), 1);
+    int contentWidth = _toBufferPixels(logicalWidth);
+    int contentHeight = _toBufferPixels(logicalHeight);
+    int previousContentWidth = _contentRect.getWidth();
+    int previousContentHeight = _contentRect.getHeight();
+
+    _contentRect = IRect::makeXYWH(_contentRect.fLeft, _contentRect.fTop, contentWidth, contentHeight);
+    resizeEglWindow(contentWidth, contentHeight);
+
+    if (_wlSurface != nullptr && _xdgSurface != nullptr && _isConfigured) {
+        xdg_surface_set_window_geometry(_xdgSurface, 0, 0, logicalWidth, logicalHeight);
+        wl_surface_commit(_wlSurface);
+    }
+
+    if (contentWidth != previousContentWidth || contentHeight != previousContentHeight) {
+        JNILocal<jobject> eventWindowResize(fEnv,
+            classes::EventWindowResize::make(fEnv, logicalWidth, logicalHeight, contentWidth, contentHeight));
+        dispatch(eventWindowResize.get());
+    }
+
+    return true;
+}
+
+int jwm::WindowWayland::_resolveEnteredOutputScale() const {
+    if (_enteredOutputs.empty()) {
+        return _resolveBufferScale();
+    }
+
+    int scale = 1;
+    for (wl_output* output : _enteredOutputs) {
+        scale = std::max(scale, _windowManager.getOutputScale(output));
+    }
+    return scale;
+}
+
 void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
     if (_xdgSurface == nullptr || _wlSurface == nullptr) {
         return;
@@ -370,7 +532,8 @@ void jwm::WindowWayland::_handleXdgSurfaceConfigure(uint32_t serial) {
     int previousContentHeight = _contentRect.getHeight();
     bool isFirstConfigure = !_isConfigured;
     bool dispatchInitialFrame = false;
-    int nextBufferScale = _resolveBufferScale();
+    _refreshScreenAssociation();
+    int nextBufferScale = _resolveEnteredOutputScale();
     bool scaleChanged = nextBufferScale != _bufferScale;
     _bufferScale = nextBufferScale;
 
@@ -486,8 +649,14 @@ bool jwm::WindowWayland::_ensureSurface() {
             JWM_LOG("Wayland: wl_compositor_create_surface failed");
             return false;
         }
+        if (wl_surface_add_listener(_wlSurface, &kSurfaceListener, this) != 0) {
+            JWM_LOG("Wayland: wl_surface_add_listener failed");
+            wl_surface_destroy(_wlSurface);
+            _wlSurface = nullptr;
+            return false;
+        }
         _windowManager.registerWindowSurface(_wlSurface, this);
-        _bufferScale = _resolveBufferScale();
+        _bufferScale = _resolveEnteredOutputScale();
         wl_surface_set_buffer_scale(_wlSurface, _bufferScale);
     }
 
@@ -686,6 +855,9 @@ void jwm::WindowWayland::_destroySurface() {
     _isConfigured = false;
     _isFrameRequested = false;
     _bufferScale = 1;
+    _screenId = std::numeric_limits<long>::min();
+    _enteredOutputs.clear();
+    _windowManager.requestPointerLock(this, false);
     _showHideSyncRequired = false;
     _destroyShowHideSyncCallback();
     _destroyEglWindow();
@@ -791,6 +963,12 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nS
     }
     instance->_mouseCursor = static_cast<jwm::MouseCursor>(cursorId);
     instance->getWindowManager().requestCursorUpdate(instance);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nLockMouseCursor
+        (JNIEnv* env, jobject obj, jboolean value) {
+    jwm::WindowWayland* instance = reinterpret_cast<jwm::WindowWayland*>(jwm::classes::Native::fromJava(env, obj));
+    instance->getWindowManager().requestPointerLock(instance, value == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_io_github_humbleui_jwm_WindowWayland__1nMaximize

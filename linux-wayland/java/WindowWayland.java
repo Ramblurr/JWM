@@ -92,6 +92,8 @@ public class WindowWayland extends Window {
 
     @Override
     public Window lockMouseCursor(boolean value) {
+        assert _onUIThread() : "Should be run on UI thread";
+        _nLockMouseCursor(value);
         return this;
     }
 
@@ -216,6 +218,7 @@ public class WindowWayland extends Window {
     @ApiStatus.Internal public native void _nRestore();
     @ApiStatus.Internal public native void _nSetTitle(String title);
     @ApiStatus.Internal public native void _nSetAppId(String appId);
+    @ApiStatus.Internal public native void _nLockMouseCursor(boolean value);
     @ApiStatus.Internal public native void _nSetFullScreen(boolean isFullScreen);
     @ApiStatus.Internal public native boolean _nIsFullScreen();
 }
