@@ -9,6 +9,7 @@
 #include <mutex>
 #include <queue>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "Key.hh"
@@ -17,6 +18,10 @@
 #include "ScreenInfoWayland.hh"
 
 struct wl_display;
+struct wl_data_device;
+struct wl_data_device_manager;
+struct wl_data_offer;
+struct wl_data_source;
 struct wl_compositor;
 struct wl_keyboard;
 struct wl_output;
@@ -40,6 +45,10 @@ struct zxdg_output_manager_v1;
 struct zxdg_output_v1;
 struct wp_fractional_scale_manager_v1;
 struct wp_viewporter;
+struct zwp_primary_selection_device_manager_v1;
+struct zwp_primary_selection_device_v1;
+struct zwp_primary_selection_offer_v1;
+struct zwp_primary_selection_source_v1;
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
@@ -77,6 +86,10 @@ namespace jwm {
         bool tryGetScreenForOutput(wl_output* output, ScreenInfoWayland& screen) const;
         int getOutputScale(wl_output* output) const;
         bool hasOutput(wl_output* output) const;
+        void setClipboardContents(std::map<std::string, ByteBuf>&& contents);
+        bool getClipboardContents(const std::string& formatId, ByteBuf& contents);
+        std::vector<std::string> getClipboardFormats() const;
+        void clearClipboardContents();
 
         static void onRegistryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version);
         static void onRegistryGlobalRemove(void* data, wl_registry* registry, uint32_t name);
@@ -113,6 +126,21 @@ namespace jwm {
         static void onKeyboardModifiers(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
         static void onKeyboardRepeatInfo(void* data, wl_keyboard* keyboard, int32_t rate, int32_t delay);
         static void onActivationTokenDone(void* data, xdg_activation_token_v1* token, const char* tokenString);
+        static void onDataDeviceDataOffer(void* data, wl_data_device* device, wl_data_offer* offer);
+        static void onDataDeviceEnter(void* data, wl_data_device* device, uint32_t serial, wl_surface* surface, int32_t x, int32_t y, wl_data_offer* offer);
+        static void onDataDeviceLeave(void* data, wl_data_device* device);
+        static void onDataDeviceMotion(void* data, wl_data_device* device, uint32_t time, int32_t x, int32_t y);
+        static void onDataDeviceDrop(void* data, wl_data_device* device);
+        static void onDataDeviceSelection(void* data, wl_data_device* device, wl_data_offer* offer);
+        static void onDataOfferOffer(void* data, wl_data_offer* offer, const char* mimeType);
+        static void onDataSourceTarget(void* data, wl_data_source* source, const char* mimeType);
+        static void onDataSourceSend(void* data, wl_data_source* source, const char* mimeType, int fd);
+        static void onDataSourceCancelled(void* data, wl_data_source* source);
+        static void onPrimarySelectionDeviceDataOffer(void* data, zwp_primary_selection_device_v1* device, zwp_primary_selection_offer_v1* offer);
+        static void onPrimarySelectionDeviceSelection(void* data, zwp_primary_selection_device_v1* device, zwp_primary_selection_offer_v1* offer);
+        static void onPrimarySelectionOfferOffer(void* data, zwp_primary_selection_offer_v1* offer, const char* mimeType);
+        static void onPrimarySelectionSourceSend(void* data, zwp_primary_selection_source_v1* source, const char* mimeType, int fd);
+        static void onPrimarySelectionSourceCancelled(void* data, zwp_primary_selection_source_v1* source);
 
         void _notifyLoop();
         void _drainNotifyPipe();
@@ -131,12 +159,27 @@ namespace jwm {
         bool _bindShm(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindXdgWmBase(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindSeat(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindDataDeviceManager(wl_registry* registry, uint32_t name, uint32_t version);
+        bool _bindPrimarySelectionManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindPointerConstraints(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindRelativePointerManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindDecorationManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindActivationManager(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindViewporter(wl_registry* registry, uint32_t name, uint32_t version);
         bool _bindFractionalScaleManager(wl_registry* registry, uint32_t name, uint32_t version);
+        void _ensureClipboardDevices();
+        void _resetClipboardDataDevice();
+        void _destroyClipboardSelectionOffer();
+        void _destroyClipboardSelectionSource(bool clearContents);
+        void _clearClipboardSelectionOffers();
+        void _updateLastInputSerial(uint32_t serial);
+        void _applyPendingClipboardSelection();
+        void _destroyPrimarySelectionDevice();
+        void _destroyPrimarySelectionOffer();
+        void _destroyPrimarySelectionSource();
+        void _clearPrimarySelectionOffers();
+        void _normalizeClipboardTextEntries(std::map<std::string, ByteBuf>& contents) const;
+        ByteBuf _readClipboardOffer(const std::string& mimeType);
         void _notifyWindowsOutputMetricsChanged(wl_output* output);
         void _notifyWindowsScaleCapabilityChanged();
         void _cancelActivationRequest();
@@ -169,6 +212,10 @@ namespace jwm {
         wl_registry* _registry = nullptr;
         wl_compositor* _compositor = nullptr;
         wl_shm* _shm = nullptr;
+        wl_data_device_manager* _dataDeviceManager = nullptr;
+        wl_data_device* _dataDevice = nullptr;
+        wl_data_offer* _clipboardSelectionOffer = nullptr;
+        wl_data_source* _clipboardSelectionSource = nullptr;
         xdg_wm_base* _xdgWmBase = nullptr;
         wl_seat* _seat = nullptr;
         wl_pointer* _pointer = nullptr;
@@ -184,9 +231,14 @@ namespace jwm {
         WindowWayland* _activationWindow = nullptr;
         wp_viewporter* _viewporter = nullptr;
         wp_fractional_scale_manager_v1* _fractionalScaleManager = nullptr;
+        zwp_primary_selection_device_manager_v1* _primarySelectionManager = nullptr;
+        zwp_primary_selection_device_v1* _primarySelectionDevice = nullptr;
+        zwp_primary_selection_offer_v1* _primarySelectionOffer = nullptr;
+        zwp_primary_selection_source_v1* _primarySelectionSource = nullptr;
         uint32_t _compositorName = std::numeric_limits<uint32_t>::max();
         uint32_t _compositorVersion = 0;
         uint32_t _shmName = std::numeric_limits<uint32_t>::max();
+        uint32_t _dataDeviceManagerName = std::numeric_limits<uint32_t>::max();
         uint32_t _xdgWmBaseName = std::numeric_limits<uint32_t>::max();
         uint32_t _seatName = std::numeric_limits<uint32_t>::max();
         uint32_t _seatVersion = 0;
@@ -196,6 +248,7 @@ namespace jwm {
         uint32_t _activationManagerName = std::numeric_limits<uint32_t>::max();
         uint32_t _viewporterName = std::numeric_limits<uint32_t>::max();
         uint32_t _fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
+        uint32_t _primarySelectionManagerName = std::numeric_limits<uint32_t>::max();
         zxdg_output_manager_v1* _xdgOutputManager = nullptr;
         uint32_t _xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
         std::atomic_bool _runLoop { false };
@@ -266,6 +319,15 @@ namespace jwm {
         wl_cursor_theme* _cursorTheme = nullptr;
         std::map<MouseCursor, wl_cursor*> _cursorByType;
         int _cursorThemeSize = 24;
+        std::map<std::string, ByteBuf> _clipboardSourceData;
+        std::map<std::string, ByteBuf> _clipboardSelectionCache;
+        std::map<wl_data_offer*, std::vector<std::string>> _clipboardPendingOffers;
+        std::vector<std::string> _clipboardSelectionMimeTypes;
+        bool _clipboardSetSelectionPending = false;
+        bool _clipboardClearSelectionPending = false;
+        std::map<zwp_primary_selection_offer_v1*, std::vector<std::string>> _primarySelectionPendingOffers;
+        std::vector<std::string> _primarySelectionMimeTypes;
+        bool _clipboardSelectionSourceStale = false;
 
         mutable std::mutex _taskQueueLock;
         std::queue<std::function<void()>> _taskQueue;

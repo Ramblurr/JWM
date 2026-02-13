@@ -9,6 +9,7 @@
 #include <limits>
 #include <poll.h>
 #include <string>
+#include <utility>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include "WindowWayland.hh"
 #include "impl/JNILocal.hh"
 #include "impl/Library.hh"
+#include "primary-selection-unstable-v1-client-protocol.hh"
 #include "xdg-activation-v1-client-protocol.hh"
 #include "xdg-decoration-unstable-v1-client-protocol.hh"
 #include "fractional-scale-v1-client-protocol.hh"
@@ -63,6 +65,34 @@ namespace {
     wl_seat_listener kSeatListener {
         &jwm::WindowManagerWayland::onSeatCapabilities,
         &jwm::WindowManagerWayland::onSeatName
+    };
+
+    wl_data_device_listener kDataDeviceListener {
+        &jwm::WindowManagerWayland::onDataDeviceDataOffer,
+        &jwm::WindowManagerWayland::onDataDeviceEnter,
+        &jwm::WindowManagerWayland::onDataDeviceLeave,
+        &jwm::WindowManagerWayland::onDataDeviceMotion,
+        &jwm::WindowManagerWayland::onDataDeviceDrop,
+        &jwm::WindowManagerWayland::onDataDeviceSelection
+    };
+
+    wl_data_offer_listener kDataOfferListener {
+        &jwm::WindowManagerWayland::onDataOfferOffer
+    };
+
+    wl_data_source_listener kDataSourceListener {
+        &jwm::WindowManagerWayland::onDataSourceTarget,
+        &jwm::WindowManagerWayland::onDataSourceSend,
+        &jwm::WindowManagerWayland::onDataSourceCancelled
+    };
+
+    zwp_primary_selection_device_v1_listener kPrimarySelectionDeviceListener {
+        &jwm::WindowManagerWayland::onPrimarySelectionDeviceDataOffer,
+        &jwm::WindowManagerWayland::onPrimarySelectionDeviceSelection
+    };
+
+    zwp_primary_selection_offer_v1_listener kPrimarySelectionOfferListener {
+        &jwm::WindowManagerWayland::onPrimarySelectionOfferOffer
     };
 
     wl_pointer_listener kPointerListener {
@@ -105,6 +135,32 @@ namespace {
 
     constexpr xkb_keycode_t kXkbKeycodeOffset = 8;
     constexpr float kPixelsPerScroll = 100.0f;
+    constexpr const char* kPlainTextMime = "text/plain";
+    constexpr const char* kPlainTextUtf8Mime = "text/plain;charset=utf-8";
+    constexpr const char* kUtf8StringMime = "UTF8_STRING";
+    constexpr const char* kStringMime = "STRING";
+
+    bool vectorContains(const std::vector<std::string>& values, const std::string& needle) {
+        return std::find(values.begin(), values.end(), needle) != values.end();
+    }
+
+    bool writeAllToFd(int fd, const uint8_t* data, size_t size) {
+        size_t offset = 0;
+        while (offset < size) {
+            ssize_t written = write(fd, data + offset, size - offset);
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (written == 0) {
+                return false;
+            }
+            offset += static_cast<size_t>(written);
+        }
+        return true;
+    }
 
     std::vector<const char*> cursorNamesForType(jwm::MouseCursor cursorType) {
         switch (cursorType) {
@@ -418,6 +474,8 @@ void jwm::WindowManagerWayland::_resetKeyboard() {
 void jwm::WindowManagerWayland::_resetSeat() {
     _resetPointer();
     _resetKeyboard();
+    _resetClipboardDataDevice();
+    _destroyPrimarySelectionDevice();
 
     if (_seat != nullptr) {
         if (_seatVersion >= WL_SEAT_RELEASE_SINCE_VERSION) {
@@ -461,6 +519,12 @@ void jwm::WindowManagerWayland::_cleanup() {
         _activationManager = nullptr;
     }
     _activationManagerName = std::numeric_limits<uint32_t>::max();
+
+    if (_primarySelectionManager != nullptr) {
+        zwp_primary_selection_device_manager_v1_destroy(_primarySelectionManager);
+        _primarySelectionManager = nullptr;
+    }
+    _primarySelectionManagerName = std::numeric_limits<uint32_t>::max();
 
     if (_fractionalScaleManager != nullptr) {
         wp_fractional_scale_manager_v1_destroy(_fractionalScaleManager);
@@ -507,6 +571,12 @@ void jwm::WindowManagerWayland::_cleanup() {
         _shm = nullptr;
     }
     _shmName = std::numeric_limits<uint32_t>::max();
+
+    if (_dataDeviceManager != nullptr) {
+        wl_data_device_manager_destroy(_dataDeviceManager);
+        _dataDeviceManager = nullptr;
+    }
+    _dataDeviceManagerName = std::numeric_limits<uint32_t>::max();
 
     if (_compositor != nullptr) {
         wl_compositor_destroy(_compositor);
@@ -782,7 +852,356 @@ bool jwm::WindowManagerWayland::_bindSeat(wl_registry* registry, uint32_t name, 
         _resetSeat();
         return false;
     }
+    _ensureClipboardDevices();
     return true;
+}
+
+bool jwm::WindowManagerWayland::_bindDataDeviceManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_dataDeviceManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 3u);
+    _dataDeviceManager = static_cast<wl_data_device_manager*>(
+        wl_registry_bind(registry, name, &wl_data_device_manager_interface, bindVersion));
+    if (_dataDeviceManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(wl_data_device_manager) failed");
+        return false;
+    }
+    _dataDeviceManagerName = name;
+    _ensureClipboardDevices();
+    return true;
+}
+
+bool jwm::WindowManagerWayland::_bindPrimarySelectionManager(wl_registry* registry, uint32_t name, uint32_t version) {
+    if (_primarySelectionManager != nullptr) {
+        return true;
+    }
+
+    uint32_t bindVersion = std::min<uint32_t>(version, 1u);
+    _primarySelectionManager = static_cast<zwp_primary_selection_device_manager_v1*>(
+        wl_registry_bind(registry, name, &zwp_primary_selection_device_manager_v1_interface, bindVersion));
+    if (_primarySelectionManager == nullptr) {
+        JWM_LOG("Wayland: wl_registry_bind(zwp_primary_selection_device_manager_v1) failed");
+        return false;
+    }
+    _primarySelectionManagerName = name;
+    _ensureClipboardDevices();
+    return true;
+}
+
+void jwm::WindowManagerWayland::_destroyClipboardSelectionOffer() {
+    _clipboardSelectionCache.clear();
+    _clipboardSelectionMimeTypes.clear();
+    if (_clipboardSelectionOffer != nullptr) {
+        _clipboardPendingOffers.erase(_clipboardSelectionOffer);
+        wl_data_offer_destroy(_clipboardSelectionOffer);
+        _clipboardSelectionOffer = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_destroyClipboardSelectionSource(bool clearContents) {
+    if (_clipboardSelectionSource != nullptr) {
+        wl_data_source_destroy(_clipboardSelectionSource);
+        _clipboardSelectionSource = nullptr;
+    }
+    _clipboardSelectionSourceStale = false;
+    if (clearContents) {
+        _clipboardSourceData.clear();
+    }
+}
+
+void jwm::WindowManagerWayland::_clearClipboardSelectionOffers() {
+    for (auto& entry : _clipboardPendingOffers) {
+        if (entry.first != nullptr) {
+            wl_data_offer_destroy(entry.first);
+        }
+    }
+    _clipboardPendingOffers.clear();
+}
+
+void jwm::WindowManagerWayland::_destroyPrimarySelectionOffer() {
+    _primarySelectionMimeTypes.clear();
+    if (_primarySelectionOffer != nullptr) {
+        _primarySelectionPendingOffers.erase(_primarySelectionOffer);
+        zwp_primary_selection_offer_v1_destroy(_primarySelectionOffer);
+        _primarySelectionOffer = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_destroyPrimarySelectionSource() {
+    if (_primarySelectionSource != nullptr) {
+        zwp_primary_selection_source_v1_destroy(_primarySelectionSource);
+        _primarySelectionSource = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_clearPrimarySelectionOffers() {
+    for (auto& entry : _primarySelectionPendingOffers) {
+        if (entry.first != nullptr) {
+            zwp_primary_selection_offer_v1_destroy(entry.first);
+        }
+    }
+    _primarySelectionPendingOffers.clear();
+}
+
+void jwm::WindowManagerWayland::_destroyPrimarySelectionDevice() {
+    _destroyPrimarySelectionOffer();
+    _destroyPrimarySelectionSource();
+    _clearPrimarySelectionOffers();
+    if (_primarySelectionDevice != nullptr) {
+        zwp_primary_selection_device_v1_destroy(_primarySelectionDevice);
+        _primarySelectionDevice = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_resetClipboardDataDevice() {
+    _destroyClipboardSelectionOffer();
+    _clearClipboardSelectionOffers();
+    _destroyClipboardSelectionSource(true);
+    _clipboardSetSelectionPending = false;
+    _clipboardClearSelectionPending = false;
+
+    if (_dataDevice != nullptr) {
+#if defined(WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+        uint32_t version = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(_dataDevice));
+        if (version >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION) {
+            wl_data_device_release(_dataDevice);
+        } else {
+            wl_data_device_destroy(_dataDevice);
+        }
+#else
+        wl_data_device_destroy(_dataDevice);
+#endif
+        _dataDevice = nullptr;
+    }
+}
+
+void jwm::WindowManagerWayland::_ensureClipboardDevices() {
+    if (_seat != nullptr && _dataDeviceManager != nullptr && _dataDevice == nullptr) {
+        _dataDevice = wl_data_device_manager_get_data_device(_dataDeviceManager, _seat);
+        if (_dataDevice == nullptr) {
+            JWM_LOG("Wayland: wl_data_device_manager_get_data_device failed");
+        } else if (wl_data_device_add_listener(_dataDevice, &kDataDeviceListener, this) != 0) {
+            JWM_LOG("Wayland: wl_data_device_add_listener failed");
+            _resetClipboardDataDevice();
+        }
+    }
+
+    if (_seat != nullptr && _primarySelectionManager != nullptr && _primarySelectionDevice == nullptr) {
+        _primarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device(_primarySelectionManager, _seat);
+        if (_primarySelectionDevice == nullptr) {
+            JWM_LOG("Wayland: zwp_primary_selection_device_manager_v1_get_device failed");
+        } else if (zwp_primary_selection_device_v1_add_listener(_primarySelectionDevice, &kPrimarySelectionDeviceListener, this) != 0) {
+            JWM_LOG("Wayland: zwp_primary_selection_device_v1_add_listener failed");
+            _destroyPrimarySelectionDevice();
+        }
+    }
+
+    _applyPendingClipboardSelection();
+}
+
+void jwm::WindowManagerWayland::_updateLastInputSerial(uint32_t serial) {
+    _lastInputSerial = serial;
+    if (_lastInputSerial != 0) {
+        _applyPendingClipboardSelection();
+    }
+}
+
+void jwm::WindowManagerWayland::_applyPendingClipboardSelection() {
+    if (_dataDevice == nullptr || _lastInputSerial == 0) {
+        return;
+    }
+
+    if (_clipboardClearSelectionPending) {
+        wl_data_device_set_selection(_dataDevice, nullptr, _lastInputSerial);
+        _clipboardClearSelectionPending = false;
+        _clipboardSetSelectionPending = false;
+        return;
+    }
+
+    if (_clipboardSetSelectionPending && _clipboardSelectionSource != nullptr) {
+        wl_data_device_set_selection(_dataDevice, _clipboardSelectionSource, _lastInputSerial);
+        _clipboardSetSelectionPending = false;
+    }
+}
+
+void jwm::WindowManagerWayland::_normalizeClipboardTextEntries(std::map<std::string, ByteBuf>& contents) const {
+    auto plainTextIt = contents.find(kPlainTextMime);
+    auto utf8TextIt = contents.find(kPlainTextUtf8Mime);
+
+    if (plainTextIt == contents.end() && utf8TextIt == contents.end()) {
+        return;
+    }
+
+    ByteBuf canonicalText;
+    if (plainTextIt != contents.end()) {
+        canonicalText = plainTextIt->second;
+    } else {
+        canonicalText = utf8TextIt->second;
+    }
+
+    contents[kPlainTextMime] = canonicalText;
+    contents[kPlainTextUtf8Mime] = std::move(canonicalText);
+}
+
+jwm::ByteBuf jwm::WindowManagerWayland::_readClipboardOffer(const std::string& mimeType) {
+    if (_clipboardSelectionOffer == nullptr) {
+        return {};
+    }
+
+    int pipeFds[2];
+    if (pipe(pipeFds) != 0) {
+        JWM_LOG("Wayland: pipe failed while receiving clipboard data: " << strerror(errno));
+        return {};
+    }
+
+    wl_data_offer_receive(_clipboardSelectionOffer, mimeType.c_str(), pipeFds[1]);
+    close(pipeFds[1]);
+
+    if (_display != nullptr && wl_display_flush(_display) < 0 && errno != EAGAIN) {
+        JWM_LOG("Wayland: wl_display_flush failed during clipboard receive");
+    }
+
+    jwm::ByteBuf bytes;
+    while (true) {
+        uint8_t buffer[4096];
+        ssize_t readCount = read(pipeFds[0], buffer, sizeof(buffer));
+        if (readCount > 0) {
+            bytes.insert(bytes.end(), buffer, buffer + readCount);
+            continue;
+        }
+        if (readCount < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+
+    close(pipeFds[0]);
+    return bytes;
+}
+
+void jwm::WindowManagerWayland::setClipboardContents(std::map<std::string, ByteBuf>&& contents) {
+    if (contents.empty()) {
+        clearClipboardContents();
+        return;
+    }
+
+    _normalizeClipboardTextEntries(contents);
+    _destroyClipboardSelectionSource(true);
+    _clipboardSourceData = std::move(contents);
+
+    if (_dataDeviceManager == nullptr) {
+        _clipboardSetSelectionPending = false;
+        _clipboardClearSelectionPending = false;
+        return;
+    }
+
+    _clipboardSelectionSource = wl_data_device_manager_create_data_source(_dataDeviceManager);
+    if (_clipboardSelectionSource == nullptr) {
+        JWM_LOG("Wayland: wl_data_device_manager_create_data_source failed");
+        _clipboardSourceData.clear();
+        return;
+    }
+
+    if (wl_data_source_add_listener(_clipboardSelectionSource, &kDataSourceListener, this) != 0) {
+        JWM_LOG("Wayland: wl_data_source_add_listener failed");
+        _destroyClipboardSelectionSource(true);
+        return;
+    }
+
+    for (const auto& entry : _clipboardSourceData) {
+        wl_data_source_offer(_clipboardSelectionSource, entry.first.c_str());
+    }
+
+    _clipboardClearSelectionPending = false;
+    _clipboardSetSelectionPending = true;
+    _clipboardSelectionSourceStale = false;
+    _applyPendingClipboardSelection();
+}
+
+bool jwm::WindowManagerWayland::getClipboardContents(const std::string& formatId, jwm::ByteBuf& contents) {
+    contents.clear();
+    if (formatId.empty()) {
+        return false;
+    }
+
+    std::vector<std::string> candidateMimes;
+    if (formatId == kPlainTextMime) {
+        candidateMimes.push_back(kPlainTextUtf8Mime);
+        candidateMimes.push_back(kPlainTextMime);
+        candidateMimes.push_back(kUtf8StringMime);
+        candidateMimes.push_back(kStringMime);
+    } else {
+        candidateMimes.push_back(formatId);
+    }
+
+    if (_clipboardSelectionSource != nullptr && !_clipboardSelectionSourceStale) {
+        for (const auto& candidate : candidateMimes) {
+            auto sourceIt = _clipboardSourceData.find(candidate);
+            if (sourceIt != _clipboardSourceData.end()) {
+                contents = sourceIt->second;
+                return true;
+            }
+        }
+    }
+
+    if (_clipboardSelectionOffer == nullptr) {
+        return false;
+    }
+
+    for (const auto& candidate : candidateMimes) {
+        if (!vectorContains(_clipboardSelectionMimeTypes, candidate)) {
+            continue;
+        }
+
+        auto cached = _clipboardSelectionCache.find(candidate);
+        if (cached != _clipboardSelectionCache.end()) {
+            contents = cached->second;
+            return true;
+        }
+
+        jwm::ByteBuf bytes = _readClipboardOffer(candidate);
+        _clipboardSelectionCache[candidate] = bytes;
+        contents = std::move(bytes);
+        return true;
+    }
+
+    return false;
+}
+
+std::vector<std::string> jwm::WindowManagerWayland::getClipboardFormats() const {
+    if (_clipboardSelectionSource != nullptr && !_clipboardSelectionSourceStale) {
+        std::vector<std::string> localFormats;
+        localFormats.reserve(_clipboardSourceData.size());
+        for (const auto& entry : _clipboardSourceData) {
+            localFormats.push_back(entry.first);
+        }
+        return localFormats;
+    }
+
+    if (_clipboardSelectionOffer == nullptr) {
+        return {};
+    }
+
+    return _clipboardSelectionMimeTypes;
+}
+
+void jwm::WindowManagerWayland::clearClipboardContents() {
+    _destroyClipboardSelectionSource(true);
+    _clipboardSetSelectionPending = false;
+    _clipboardSelectionSourceStale = false;
+
+    if (_dataDevice != nullptr) {
+        if (_lastInputSerial != 0) {
+            wl_data_device_set_selection(_dataDevice, nullptr, _lastInputSerial);
+            _clipboardClearSelectionPending = false;
+        } else {
+            _clipboardClearSelectionPending = true;
+        }
+    } else {
+        _clipboardClearSelectionPending = false;
+    }
 }
 
 bool jwm::WindowManagerWayland::_bindPointerConstraints(wl_registry* registry, uint32_t name, uint32_t version) {
@@ -1771,6 +2190,10 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
         manager->_bindShm(registry, name, version);
         return;
     }
+    if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+        manager->_bindDataDeviceManager(registry, name, version);
+        return;
+    }
     if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         manager->_bindXdgWmBase(registry, name, version);
         return;
@@ -1805,6 +2228,10 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
     }
     if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         manager->_bindFractionalScaleManager(registry, name, version);
+        return;
+    }
+    if (strcmp(interface, zwp_primary_selection_device_manager_v1_interface.name) == 0) {
+        manager->_bindPrimarySelectionManager(registry, name, version);
         return;
     }
     if (strcmp(interface, wl_output_interface.name) != 0) {
@@ -1860,6 +2287,15 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
             manager->_shm = nullptr;
         }
         manager->_shmName = std::numeric_limits<uint32_t>::max();
+        return;
+    }
+    if (name == manager->_dataDeviceManagerName) {
+        manager->_resetClipboardDataDevice();
+        if (manager->_dataDeviceManager != nullptr) {
+            wl_data_device_manager_destroy(manager->_dataDeviceManager);
+            manager->_dataDeviceManager = nullptr;
+        }
+        manager->_dataDeviceManagerName = std::numeric_limits<uint32_t>::max();
         return;
     }
     if (name == manager->_seatName) {
@@ -1925,6 +2361,15 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
         }
         manager->_fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
         manager->_notifyWindowsScaleCapabilityChanged();
+        return;
+    }
+    if (name == manager->_primarySelectionManagerName) {
+        manager->_destroyPrimarySelectionDevice();
+        if (manager->_primarySelectionManager != nullptr) {
+            zwp_primary_selection_device_manager_v1_destroy(manager->_primarySelectionManager);
+            manager->_primarySelectionManager = nullptr;
+        }
+        manager->_primarySelectionManagerName = std::numeric_limits<uint32_t>::max();
         return;
     }
     if (name == manager->_xdgOutputManagerName) {
@@ -2057,6 +2502,7 @@ void jwm::WindowManagerWayland::onSeatCapabilities(void* data, wl_seat* seat, ui
     } else if (!hasKeyboard && manager->_keyboard != nullptr) {
         manager->_resetKeyboard();
     }
+    manager->_ensureClipboardDevices();
     manager->_updatePointerLock();
 }
 
@@ -2066,13 +2512,255 @@ void jwm::WindowManagerWayland::onSeatName(void* data, wl_seat* seat, const char
     (void) name;
 }
 
+void jwm::WindowManagerWayland::onDataDeviceDataOffer(void* data, wl_data_device* device, wl_data_offer* offer) {
+    (void) device;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (offer == nullptr) {
+        return;
+    }
+
+    manager->_clipboardPendingOffers.emplace(offer, std::vector<std::string>());
+    if (wl_data_offer_add_listener(offer, &kDataOfferListener, manager) != 0) {
+        JWM_LOG("Wayland: wl_data_offer_add_listener failed");
+        manager->_clipboardPendingOffers.erase(offer);
+        wl_data_offer_destroy(offer);
+    }
+}
+
+void jwm::WindowManagerWayland::onDataDeviceEnter(
+        void* data,
+        wl_data_device* device,
+        uint32_t serial,
+        wl_surface* surface,
+        int32_t x,
+        int32_t y,
+        wl_data_offer* offer) {
+    (void) device;
+    (void) surface;
+    (void) x;
+    (void) y;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_updateLastInputSerial(serial);
+
+    if (offer == nullptr) {
+        return;
+    }
+
+    manager->_clipboardPendingOffers.erase(offer);
+    if (offer != manager->_clipboardSelectionOffer) {
+        wl_data_offer_destroy(offer);
+    }
+}
+
+void jwm::WindowManagerWayland::onDataDeviceLeave(void* data, wl_data_device* device) {
+    (void) data;
+    (void) device;
+}
+
+void jwm::WindowManagerWayland::onDataDeviceMotion(void* data, wl_data_device* device, uint32_t time, int32_t x, int32_t y) {
+    (void) data;
+    (void) device;
+    (void) time;
+    (void) x;
+    (void) y;
+}
+
+void jwm::WindowManagerWayland::onDataDeviceDrop(void* data, wl_data_device* device) {
+    (void) data;
+    (void) device;
+}
+
+void jwm::WindowManagerWayland::onDataDeviceSelection(void* data, wl_data_device* device, wl_data_offer* offer) {
+    (void) device;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+
+    manager->_destroyClipboardSelectionOffer();
+    manager->_clipboardSelectionCache.clear();
+
+    if (offer == nullptr) {
+        return;
+    }
+
+    auto pending = manager->_clipboardPendingOffers.find(offer);
+    if (pending != manager->_clipboardPendingOffers.end()) {
+        manager->_clipboardSelectionMimeTypes = std::move(pending->second);
+        manager->_clipboardPendingOffers.erase(pending);
+    } else {
+        manager->_clipboardSelectionMimeTypes.clear();
+    }
+
+    manager->_clipboardSelectionOffer = offer;
+    if (manager->_clipboardSelectionSource != nullptr) {
+        manager->_clipboardSelectionSourceStale = true;
+    }
+}
+
+void jwm::WindowManagerWayland::onDataOfferOffer(void* data, wl_data_offer* offer, const char* mimeType) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (offer == nullptr || mimeType == nullptr || mimeType[0] == '\0') {
+        return;
+    }
+
+    std::string mime(mimeType);
+    if (offer == manager->_clipboardSelectionOffer) {
+        if (!vectorContains(manager->_clipboardSelectionMimeTypes, mime)) {
+            manager->_clipboardSelectionMimeTypes.push_back(std::move(mime));
+        }
+        return;
+    }
+
+    std::vector<std::string>& mimes = manager->_clipboardPendingOffers[offer];
+    if (!vectorContains(mimes, mime)) {
+        mimes.push_back(std::move(mime));
+    }
+}
+
+void jwm::WindowManagerWayland::onDataSourceTarget(void* data, wl_data_source* source, const char* mimeType) {
+    (void) data;
+    (void) source;
+    (void) mimeType;
+}
+
+void jwm::WindowManagerWayland::onDataSourceSend(void* data, wl_data_source* source, const char* mimeType, int fd) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (fd < 0) {
+        return;
+    }
+
+    if (source != manager->_clipboardSelectionSource || mimeType == nullptr) {
+        close(fd);
+        return;
+    }
+
+    auto contentIt = manager->_clipboardSourceData.find(mimeType);
+    if (contentIt == manager->_clipboardSourceData.end()) {
+        close(fd);
+        return;
+    }
+
+    const ByteBuf& bytes = contentIt->second;
+    if (!bytes.empty() && !writeAllToFd(fd, bytes.data(), bytes.size())) {
+        JWM_LOG("Wayland: clipboard source write failed: " << strerror(errno));
+    }
+    close(fd);
+}
+
+void jwm::WindowManagerWayland::onDataSourceCancelled(void* data, wl_data_source* source) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (source == nullptr) {
+        return;
+    }
+
+    wl_data_source_destroy(source);
+    if (source != manager->_clipboardSelectionSource) {
+        return;
+    }
+
+    manager->_clipboardSelectionSource = nullptr;
+    manager->_clipboardSourceData.clear();
+    manager->_clipboardSetSelectionPending = false;
+    manager->_clipboardClearSelectionPending = false;
+    manager->_clipboardSelectionSourceStale = false;
+}
+
+void jwm::WindowManagerWayland::onPrimarySelectionDeviceDataOffer(
+        void* data,
+        zwp_primary_selection_device_v1* device,
+        zwp_primary_selection_offer_v1* offer) {
+    (void) device;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (offer == nullptr) {
+        return;
+    }
+
+    manager->_primarySelectionPendingOffers.emplace(offer, std::vector<std::string>());
+    if (zwp_primary_selection_offer_v1_add_listener(offer, &kPrimarySelectionOfferListener, manager) != 0) {
+        JWM_LOG("Wayland: zwp_primary_selection_offer_v1_add_listener failed");
+        manager->_primarySelectionPendingOffers.erase(offer);
+        zwp_primary_selection_offer_v1_destroy(offer);
+    }
+}
+
+void jwm::WindowManagerWayland::onPrimarySelectionDeviceSelection(
+        void* data,
+        zwp_primary_selection_device_v1* device,
+        zwp_primary_selection_offer_v1* offer) {
+    (void) device;
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    manager->_destroyPrimarySelectionOffer();
+
+    if (offer == nullptr) {
+        return;
+    }
+
+    auto pending = manager->_primarySelectionPendingOffers.find(offer);
+    if (pending != manager->_primarySelectionPendingOffers.end()) {
+        manager->_primarySelectionMimeTypes = std::move(pending->second);
+        manager->_primarySelectionPendingOffers.erase(pending);
+    } else {
+        manager->_primarySelectionMimeTypes.clear();
+    }
+
+    manager->_primarySelectionOffer = offer;
+}
+
+void jwm::WindowManagerWayland::onPrimarySelectionOfferOffer(
+        void* data,
+        zwp_primary_selection_offer_v1* offer,
+        const char* mimeType) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (offer == nullptr || mimeType == nullptr || mimeType[0] == '\0') {
+        return;
+    }
+
+    std::string mime(mimeType);
+    if (offer == manager->_primarySelectionOffer) {
+        if (!vectorContains(manager->_primarySelectionMimeTypes, mime)) {
+            manager->_primarySelectionMimeTypes.push_back(std::move(mime));
+        }
+        return;
+    }
+
+    std::vector<std::string>& mimes = manager->_primarySelectionPendingOffers[offer];
+    if (!vectorContains(mimes, mime)) {
+        mimes.push_back(std::move(mime));
+    }
+}
+
+void jwm::WindowManagerWayland::onPrimarySelectionSourceSend(
+        void* data,
+        zwp_primary_selection_source_v1* source,
+        const char* mimeType,
+        int fd) {
+    (void) data;
+    (void) source;
+    (void) mimeType;
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+void jwm::WindowManagerWayland::onPrimarySelectionSourceCancelled(
+        void* data,
+        zwp_primary_selection_source_v1* source) {
+    WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
+    if (source == nullptr) {
+        return;
+    }
+
+    zwp_primary_selection_source_v1_destroy(source);
+    if (source == manager->_primarySelectionSource) {
+        manager->_primarySelectionSource = nullptr;
+    }
+}
+
 void jwm::WindowManagerWayland::onPointerEnter(void* data, wl_pointer* pointer, uint32_t serial, wl_surface* surface, int32_t sx, int32_t sy) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
 
     WindowWayland* window = manager->_windowBySurface(surface);
     manager->_pointerFocusWindow = window;
     manager->_pointerEnterSerial = serial;
-    manager->_lastInputSerial = serial;
+    manager->_updateLastInputSerial(serial);
 
     if (window == nullptr) {
         return;
@@ -2121,7 +2809,7 @@ void jwm::WindowManagerWayland::onPointerMotion(void* data, wl_pointer* pointer,
 
 void jwm::WindowManagerWayland::onPointerButton(void* data, wl_pointer* pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
-    manager->_lastInputSerial = serial;
+    manager->_updateLastInputSerial(serial);
     if (manager->_pointerFocusWindow == nullptr || !MouseButtonWayland::isButton(button)) {
         return;
     }
@@ -2347,7 +3035,7 @@ void jwm::WindowManagerWayland::onKeyboardKeymap(void* data, wl_keyboard* keyboa
 
 void jwm::WindowManagerWayland::onKeyboardEnter(void* data, wl_keyboard* keyboard, uint32_t serial, wl_surface* surface, wl_array* keys) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
-    manager->_lastInputSerial = serial;
+    manager->_updateLastInputSerial(serial);
     WindowWayland* window = manager->_windowBySurface(surface);
     manager->_handleKeyboardFocusEnter(window, keys);
 }
@@ -2359,7 +3047,7 @@ void jwm::WindowManagerWayland::onKeyboardLeave(void* data, wl_keyboard* keyboar
 
 void jwm::WindowManagerWayland::onKeyboardKey(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t time, uint32_t keycode, uint32_t state) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
-    manager->_lastInputSerial = serial;
+    manager->_updateLastInputSerial(serial);
     WindowWayland* window = manager->_keyboardFocusWindow;
     if (window == nullptr) {
         return;
@@ -2403,7 +3091,7 @@ void jwm::WindowManagerWayland::onKeyboardKey(void* data, wl_keyboard* keyboard,
 
 void jwm::WindowManagerWayland::onKeyboardModifiers(void* data, wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
     WindowManagerWayland* manager = static_cast<WindowManagerWayland*>(data);
-    manager->_lastInputSerial = serial;
+    manager->_updateLastInputSerial(serial);
     if (manager->_xkbState == nullptr) {
         return;
     }
