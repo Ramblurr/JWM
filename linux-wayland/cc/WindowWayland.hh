@@ -139,6 +139,7 @@ namespace jwm {
         int32_t _pendingHeight = 600;
         int _bufferScale = 1;
         int _preferredBufferScale = 0;
+        uint32_t _preferredBufferTransform = 0;
         uint32_t _preferredFractionalScaleNumerator = 0;
         uint32_t _scaleNumerator = 120;
         uint32_t _lastConfigureSerial = 0;

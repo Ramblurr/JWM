@@ -513,9 +513,15 @@ void jwm::WindowWayland::onSurfacePreferredBufferScale(void* data, wl_surface* s
 }
 
 void jwm::WindowWayland::onSurfacePreferredBufferTransform(void* data, wl_surface* surface, uint32_t transform) {
-    (void) data;
     (void) surface;
-    (void) transform;
+    WindowWayland* instance = static_cast<WindowWayland*>(data);
+    if (instance == nullptr || instance->_isClosed) {
+        return;
+    }
+    if (transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
+        return;
+    }
+    instance->_preferredBufferTransform = transform;
 }
 #endif
 
@@ -1199,6 +1205,7 @@ void jwm::WindowWayland::_destroySurface() {
     _bufferScale = 1;
     _scaleNumerator = 120;
     _preferredBufferScale = 0;
+    _preferredBufferTransform = WL_OUTPUT_TRANSFORM_NORMAL;
     _preferredFractionalScaleNumerator = 0;
     _isActivated = false;
     _isMinimized = false;

@@ -123,6 +123,29 @@ namespace {
         }
     }
 
+    int32_t normalizeOutputTransform(int32_t transform) {
+        switch (transform) {
+            case WL_OUTPUT_TRANSFORM_NORMAL:
+            case WL_OUTPUT_TRANSFORM_90:
+            case WL_OUTPUT_TRANSFORM_180:
+            case WL_OUTPUT_TRANSFORM_270:
+            case WL_OUTPUT_TRANSFORM_FLIPPED:
+            case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+            case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+            case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+                return transform;
+            default:
+                return WL_OUTPUT_TRANSFORM_NORMAL;
+        }
+    }
+
+    bool isQuarterTurnOutputTransform(int32_t transform) {
+        return transform == WL_OUTPUT_TRANSFORM_90 ||
+            transform == WL_OUTPUT_TRANSFORM_270 ||
+            transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 ||
+            transform == WL_OUTPUT_TRANSFORM_FLIPPED_270;
+    }
+
 }
 
 struct jwm::WaylandOutputState {
@@ -141,6 +164,7 @@ struct jwm::WaylandOutputState {
     int32_t logicalWidth = 0;
     int32_t logicalHeight = 0;
     int32_t scale = 1;
+    int32_t transform = WL_OUTPUT_TRANSFORM_NORMAL;
     bool hasMode = false;
     bool hasLogicalPosition = false;
     bool hasLogicalSize = false;
@@ -532,6 +556,9 @@ void jwm::WindowManagerWayland::_rebuildScreens() {
         int32_t boundsY = output.hasLogicalPosition ? output.logicalY : output.y;
         int32_t boundsWidth = output.hasLogicalSize ? output.logicalWidth : output.width;
         int32_t boundsHeight = output.hasLogicalSize ? output.logicalHeight : output.height;
+        if (!output.hasLogicalSize && isQuarterTurnOutputTransform(output.transform)) {
+            std::swap(boundsWidth, boundsHeight);
+        }
         if (boundsWidth <= 0 || boundsHeight <= 0) {
             continue;
         }
@@ -1047,6 +1074,9 @@ bool jwm::WindowManagerWayland::tryGetScreenForOutput(wl_output* output, ScreenI
         int32_t boundsY = outputState.hasLogicalPosition ? outputState.logicalY : outputState.y;
         int32_t boundsWidth = outputState.hasLogicalSize ? outputState.logicalWidth : outputState.width;
         int32_t boundsHeight = outputState.hasLogicalSize ? outputState.logicalHeight : outputState.height;
+        if (!outputState.hasLogicalSize && isQuarterTurnOutputTransform(outputState.transform)) {
+            std::swap(boundsWidth, boundsHeight);
+        }
         if (boundsWidth <= 0 || boundsHeight <= 0) {
             return false;
         }
@@ -1912,7 +1942,7 @@ void jwm::WindowManagerWayland::onOutputGeometry(void* data, wl_output* output, 
     (void) output;
     outputState->x = x;
     outputState->y = y;
-    (void) transform;
+    outputState->transform = normalizeOutputTransform(transform);
     outputState->manager->_queueOutputStateChange(*outputState, true, true);
 }
 
