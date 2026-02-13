@@ -431,9 +431,7 @@ void jwm::WindowWayland::handleScaleProtocolGlobalsChanged() {
     if (_wlSurface == nullptr) {
         return;
     }
-    if (!_syncScaleProtocolObjects()) {
-        return;
-    }
+    _syncScaleProtocolObjects();
     _updateBufferScaleFromOutputs();
     if (_isVisible) {
         wl_surface_commit(_wlSurface);
@@ -901,13 +899,7 @@ bool jwm::WindowWayland::_ensureSurface() {
             return false;
         }
         _windowManager.registerWindowSurface(_wlSurface, this);
-        if (!_syncScaleProtocolObjects()) {
-            _destroyScaleProtocolObjects();
-            _windowManager.unregisterWindowSurface(_wlSurface);
-            wl_surface_destroy(_wlSurface);
-            _wlSurface = nullptr;
-            return false;
-        }
+        _syncScaleProtocolObjects();
         _scaleNumerator = _resolveScaleNumerator();
         _bufferScale = _isFractionalScalingEnabled()
             ? 1
@@ -1001,7 +993,7 @@ bool jwm::WindowWayland::_syncScaleProtocolObjects() {
         _wpViewport = wp_viewporter_get_viewport(_windowManager.getViewporter(), _wlSurface);
         if (_wpViewport == nullptr) {
             JWM_LOG("Wayland: wp_viewporter_get_viewport failed");
-            return false;
+            // Optional protocol object: keep running with integer buffer-scale fallback.
         }
     }
 
@@ -1011,13 +1003,11 @@ bool jwm::WindowWayland::_syncScaleProtocolObjects() {
             _wlSurface);
         if (_wpFractionalScale == nullptr) {
             JWM_LOG("Wayland: wp_fractional_scale_manager_v1_get_fractional_scale failed");
-            return false;
-        }
-        if (wp_fractional_scale_v1_add_listener(_wpFractionalScale, &kFractionalScaleListener, this) != 0) {
+        } else if (wp_fractional_scale_v1_add_listener(_wpFractionalScale, &kFractionalScaleListener, this) != 0) {
             JWM_LOG("Wayland: wp_fractional_scale_v1_add_listener failed");
             wp_fractional_scale_v1_destroy(_wpFractionalScale);
             _wpFractionalScale = nullptr;
-            return false;
+            _preferredFractionalScaleNumerator = 0;
         }
     }
 
