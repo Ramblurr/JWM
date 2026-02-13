@@ -411,6 +411,9 @@ bool jwm::WindowWayland::hasEnteredOutput(wl_output* output) const {
 }
 
 void jwm::WindowWayland::handleOutputMetricsChanged(wl_output* output) {
+    if (_isClosed) {
+        return;
+    }
     if (output != nullptr && !_enteredOutputs.empty()) {
         auto it = std::find(_enteredOutputs.begin(), _enteredOutputs.end(), output);
         if (it != _enteredOutputs.end() && !_windowManager.hasOutput(output)) {

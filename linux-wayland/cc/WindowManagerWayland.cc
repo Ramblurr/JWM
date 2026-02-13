@@ -129,7 +129,9 @@ struct jwm::WaylandOutputState {
     jwm::WindowManagerWayland* manager;
     uint32_t name;
     wl_output* output;
+    uint32_t wlOutputVersion = 0;
     zxdg_output_v1* xdgOutput = nullptr;
+    uint32_t xdgOutputVersion = 0;
     int32_t x = 0;
     int32_t y = 0;
     int32_t width = 0;
@@ -142,6 +144,12 @@ struct jwm::WaylandOutputState {
     bool hasMode = false;
     bool hasLogicalPosition = false;
     bool hasLogicalSize = false;
+    bool hasPendingScreenRebuild = false;
+    bool hasPendingWindowNotify = false;
+    bool hasPendingWlOutputUpdate = false;
+    bool hasPendingXdgOutputUpdate = false;
+    bool wlOutputDoneReceived = false;
+    bool xdgOutputDoneReceived = false;
     std::string xdgName;
     std::string xdgDescription;
 };
@@ -551,6 +559,58 @@ void jwm::WindowManagerWayland::_rebuildScreens() {
     }
 }
 
+void jwm::WindowManagerWayland::_queueOutputStateChange(WaylandOutputState& outputState, bool isWlOutputEvent, bool notifyWindows) {
+    outputState.hasPendingScreenRebuild = true;
+    outputState.hasPendingWindowNotify = outputState.hasPendingWindowNotify || notifyWindows;
+    if (isWlOutputEvent) {
+        outputState.hasPendingWlOutputUpdate = true;
+        outputState.wlOutputDoneReceived = false;
+    } else {
+        outputState.hasPendingXdgOutputUpdate = true;
+        outputState.xdgOutputDoneReceived = false;
+        if (outputState.xdgOutputVersion >= 3) {
+            outputState.wlOutputDoneReceived = false;
+        }
+    }
+    _commitOutputStateChangesIfReady(outputState, outputState.output);
+}
+
+void jwm::WindowManagerWayland::_commitOutputStateChangesIfReady(WaylandOutputState& outputState, wl_output* output) {
+    if (!outputState.hasPendingScreenRebuild) {
+        return;
+    }
+
+    if (outputState.hasPendingWlOutputUpdate && outputState.wlOutputVersion >= WL_OUTPUT_DONE_SINCE_VERSION && !outputState.wlOutputDoneReceived) {
+        return;
+    }
+
+    if (outputState.hasPendingXdgOutputUpdate && outputState.xdgOutput != nullptr) {
+        // xdg-output v3+ folds atomic state boundaries into wl_output.done.
+        bool xdgUsesWlOutputDone = outputState.xdgOutputVersion >= 3;
+        if (xdgUsesWlOutputDone) {
+            if (outputState.wlOutputVersion >= WL_OUTPUT_DONE_SINCE_VERSION && !outputState.wlOutputDoneReceived) {
+                return;
+            }
+        } else if (!outputState.xdgOutputDoneReceived) {
+            return;
+        }
+    }
+
+    outputState.hasPendingScreenRebuild = false;
+    outputState.hasPendingWlOutputUpdate = false;
+    outputState.hasPendingXdgOutputUpdate = false;
+    outputState.wlOutputDoneReceived = false;
+    outputState.xdgOutputDoneReceived = false;
+
+    bool shouldNotifyWindows = outputState.hasPendingWindowNotify;
+    outputState.hasPendingWindowNotify = false;
+
+    _rebuildScreens();
+    if (shouldNotifyWindows && _runLoop) {
+        _notifyWindowsOutputMetricsChanged(output);
+    }
+}
+
 void jwm::WindowManagerWayland::_clearXdgOutputBindings() {
     for (auto& outputPair : _outputByName) {
         WaylandOutputState& outputState = *outputPair.second;
@@ -558,6 +618,9 @@ void jwm::WindowManagerWayland::_clearXdgOutputBindings() {
             zxdg_output_v1_destroy(outputState.xdgOutput);
             outputState.xdgOutput = nullptr;
         }
+        outputState.xdgOutputVersion = 0;
+        outputState.hasPendingXdgOutputUpdate = false;
+        outputState.xdgOutputDoneReceived = false;
         outputState.hasLogicalPosition = false;
         outputState.hasLogicalSize = false;
         outputState.logicalX = 0;
@@ -601,7 +664,12 @@ void jwm::WindowManagerWayland::_bindXdgOutputForOutput(WaylandOutputState& outp
         JWM_LOG("Wayland: zxdg_output_v1_add_listener failed");
         zxdg_output_v1_destroy(outputState.xdgOutput);
         outputState.xdgOutput = nullptr;
+        outputState.xdgOutputVersion = 0;
+        outputState.hasPendingXdgOutputUpdate = false;
+        outputState.xdgOutputDoneReceived = false;
+        return;
     }
+    outputState.xdgOutputVersion = wl_proxy_get_version(reinterpret_cast<wl_proxy*>(outputState.xdgOutput));
 }
 
 bool jwm::WindowManagerWayland::_bindCompositor(wl_registry* registry, uint32_t name, uint32_t version) {
@@ -782,12 +850,16 @@ void jwm::WindowManagerWayland::_notifyWindowsOutputMetricsChanged(wl_output* ou
     std::vector<WindowWayland*> windows;
     windows.reserve(_surfaceToWindow.size());
     for (const auto& surfaceEntry : _surfaceToWindow) {
-        windows.push_back(surfaceEntry.second);
+        WindowWayland* window = surfaceEntry.second;
+        if (window == nullptr) {
+            continue;
+        }
+        window->ref();
+        windows.push_back(window);
     }
     for (WindowWayland* window : windows) {
-        if (window != nullptr) {
-            window->handleOutputMetricsChanged(output);
-        }
+        window->handleOutputMetricsChanged(output);
+        window->unref();
     }
 }
 
@@ -795,12 +867,16 @@ void jwm::WindowManagerWayland::_notifyWindowsScaleCapabilityChanged() {
     std::vector<WindowWayland*> windows;
     windows.reserve(_surfaceToWindow.size());
     for (const auto& surfaceEntry : _surfaceToWindow) {
-        windows.push_back(surfaceEntry.second);
+        WindowWayland* window = surfaceEntry.second;
+        if (window == nullptr) {
+            continue;
+        }
+        window->ref();
+        windows.push_back(window);
     }
     for (WindowWayland* window : windows) {
-        if (window != nullptr) {
-            window->handleScaleProtocolGlobalsChanged();
-        }
+        window->handleScaleProtocolGlobalsChanged();
+        window->unref();
     }
 }
 
@@ -1700,6 +1776,7 @@ void jwm::WindowManagerWayland::onRegistryGlobal(void* data, wl_registry* regist
     outputState->manager = manager;
     outputState->name = name;
     outputState->output = output;
+    outputState->wlOutputVersion = bindVersion;
 
     if (wl_output_add_listener(output, &kOutputListener, outputState.get()) != 0) {
         JWM_LOG("Wayland: wl_output_add_listener failed");
@@ -1832,69 +1909,72 @@ void jwm::WindowManagerWayland::onRegistryGlobalRemove(void* data, wl_registry* 
 
 void jwm::WindowManagerWayland::onOutputGeometry(void* data, wl_output* output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char* make, const char* model, int32_t transform) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) output;
     outputState->x = x;
     outputState->y = y;
     (void) transform;
-    outputState->manager->_rebuildScreens();
-    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
+    outputState->manager->_queueOutputStateChange(*outputState, true, true);
 }
 
 void jwm::WindowManagerWayland::onOutputMode(void* data, wl_output* output, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) output;
     if ((flags & WL_OUTPUT_MODE_CURRENT) != 0 || !outputState->hasMode) {
         outputState->width = width;
         outputState->height = height;
         outputState->hasMode = true;
     }
-    outputState->manager->_rebuildScreens();
-    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
+    outputState->manager->_queueOutputStateChange(*outputState, true, true);
 }
 
 void jwm::WindowManagerWayland::onOutputDone(void* data, wl_output* output) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
-    outputState->manager->_rebuildScreens();
+    outputState->wlOutputDoneReceived = true;
+    outputState->manager->_commitOutputStateChangesIfReady(*outputState, output);
 }
 
 void jwm::WindowManagerWayland::onOutputScale(void* data, wl_output* output, int32_t factor) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) output;
     outputState->scale = std::max(1, factor);
-    outputState->manager->_rebuildScreens();
-    outputState->manager->_notifyWindowsOutputMetricsChanged(output);
+    outputState->manager->_queueOutputStateChange(*outputState, true, true);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalPosition(void* data, zxdg_output_v1* xdgOutput, int32_t x, int32_t y) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) xdgOutput;
     outputState->logicalX = x;
     outputState->logicalY = y;
     outputState->hasLogicalPosition = true;
-    outputState->manager->_rebuildScreens();
-    outputState->manager->_notifyWindowsOutputMetricsChanged(outputState->output);
+    outputState->manager->_queueOutputStateChange(*outputState, false, true);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputLogicalSize(void* data, zxdg_output_v1* xdgOutput, int32_t width, int32_t height) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) xdgOutput;
     outputState->logicalWidth = width;
     outputState->logicalHeight = height;
     outputState->hasLogicalSize = true;
-    outputState->manager->_rebuildScreens();
-    outputState->manager->_notifyWindowsOutputMetricsChanged(outputState->output);
+    outputState->manager->_queueOutputStateChange(*outputState, false, true);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputDone(void* data, zxdg_output_v1* xdgOutput) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
-    outputState->manager->_rebuildScreens();
+    (void) xdgOutput;
+    outputState->xdgOutputDoneReceived = true;
+    outputState->manager->_commitOutputStateChangesIfReady(*outputState, outputState->output);
 }
 
 void jwm::WindowManagerWayland::onXdgOutputName(void* data, zxdg_output_v1* xdgOutput, const char* name) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) xdgOutput;
     outputState->xdgName = name != nullptr ? name : "";
-    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgOutputDescription(void* data, zxdg_output_v1* xdgOutput, const char* description) {
     WaylandOutputState* outputState = static_cast<WaylandOutputState*>(data);
+    (void) xdgOutput;
     outputState->xdgDescription = description != nullptr ? description : "";
-    outputState->manager->_rebuildScreens();
 }
 
 void jwm::WindowManagerWayland::onXdgWmBasePing(void* data, xdg_wm_base* xdgWmBase, uint32_t serial) {

@@ -120,6 +120,8 @@ namespace jwm {
         void _dispatchRepeatIfNeeded();
         int _getPollTimeoutMillis() const;
         void _rebuildScreens();
+        void _queueOutputStateChange(struct WaylandOutputState& outputState, bool isWlOutputEvent, bool notifyWindows);
+        void _commitOutputStateChangesIfReady(struct WaylandOutputState& outputState, wl_output* output);
         bool _initializeNotifyPipe();
         void _cleanup();
         bool _bindXdgOutputManager(wl_registry* registry, uint32_t name, uint32_t version);
