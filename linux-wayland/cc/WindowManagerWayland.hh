@@ -198,7 +198,9 @@ namespace jwm {
         uint32_t _fractionalScaleManagerName = std::numeric_limits<uint32_t>::max();
         zxdg_output_manager_v1* _xdgOutputManager = nullptr;
         uint32_t _xdgOutputManagerName = std::numeric_limits<uint32_t>::max();
-        bool _runLoop = false;
+        std::atomic_bool _runLoop { false };
+        std::atomic_bool _isInRunLoop { false };
+        std::atomic_bool _isCleanedUp { false };
 
         int _notifyReadFd = -1;
         int _notifyWriteFd = -1;

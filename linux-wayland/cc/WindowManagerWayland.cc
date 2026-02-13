@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -182,6 +183,10 @@ jwm::WindowManagerWayland::WindowManagerWayland() {
 }
 
 jwm::WindowManagerWayland::~WindowManagerWayland() {
+    terminate();
+    while (_isInRunLoop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     _cleanup();
 }
 
@@ -206,6 +211,8 @@ bool jwm::WindowManagerWayland::_initializeNotifyPipe() {
 }
 
 bool jwm::WindowManagerWayland::connect() {
+    _isCleanedUp.store(false);
+
     _display = wl_display_connect(nullptr);
     if (_display == nullptr) {
         JWM_LOG("Wayland: wl_display_connect failed");
@@ -426,7 +433,12 @@ void jwm::WindowManagerWayland::_resetSeat() {
 }
 
 void jwm::WindowManagerWayland::_cleanup() {
-    _runLoop = false;
+    bool expected = false;
+    if (!_isCleanedUp.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    _runLoop.store(false);
 
     _resetSeat();
     _destroyCursorResources();
@@ -633,7 +645,7 @@ void jwm::WindowManagerWayland::_commitOutputStateChangesIfReady(WaylandOutputSt
     outputState.hasPendingWindowNotify = false;
 
     _rebuildScreens();
-    if (shouldNotifyWindows && _runLoop) {
+    if (shouldNotifyWindows && _runLoop.load()) {
         _notifyWindowsOutputMetricsChanged(output);
     }
 }
@@ -1337,27 +1349,30 @@ void jwm::WindowManagerWayland::runLoop() {
         return;
     }
 
+    _isInRunLoop.store(true);
+
     int displayFd = wl_display_get_fd(_display);
     if (displayFd < 0) {
         JWM_LOG("Wayland: wl_display_get_fd failed");
         _cleanup();
+        _isInRunLoop.store(false);
         return;
     }
 
-    _runLoop = true;
-    while (_runLoop) {
+    _runLoop.store(true);
+    while (_runLoop.load()) {
         _processTasks();
         _dispatchRepeatIfNeeded();
 
         while (wl_display_prepare_read(_display) != 0) {
             if (wl_display_dispatch_pending(_display) < 0) {
-                _runLoop = false;
+                _runLoop.store(false);
                 break;
             }
             _processTasks();
             _dispatchRepeatIfNeeded();
         }
-        if (!_runLoop) {
+        if (!_runLoop.load()) {
             break;
         }
 
@@ -1409,10 +1424,11 @@ void jwm::WindowManagerWayland::runLoop() {
 
     _processTasks();
     _cleanup();
+    _isInRunLoop.store(false);
 }
 
 void jwm::WindowManagerWayland::terminate() {
-    _runLoop = false;
+    _runLoop.store(false);
     _notifyLoop();
 }
 
